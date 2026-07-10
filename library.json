@@ -1,0 +1,7 @@
+{
+  "name": "proximity_engine",
+  "version": "1.0.0",
+  "description": "Impulse shared proximity engine — Modes A/B/C. Select role per build with -DPROXIMITY_ROLE_WATCH or -DPROXIMITY_ROLE_ANCHOR (set in each project's build_flags).",
+  "frameworks": ["arduino"],
+  "platforms": ["espressif32"]
+}
