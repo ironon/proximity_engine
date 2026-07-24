@@ -37,7 +37,15 @@
 #define PROX_NVS_PERSIST_INTERVAL_S          300
 #define ANCHOR_PROX_BLE_SCAN_INTERVAL_MS     2000
 #define ANCHOR_PROX_BLE_SCAN_DURATION_MS     500
-#define ANCHOR_PROX_WIFI_SCAN_INTERVAL_S     30
+#define ANCHOR_PROX_WIFI_SCAN_INTERVAL_S     250
+// esp_wifi_scan_start() leaks ~1.5 KB/call under BLE coexistence on the C3 (an
+// ESP-IDF/coex issue we can't free from app code). The anchor is stationary and
+// its WiFi contribution to Signal A is stale-gated (ANCHOR_PROX_DEVICE_STALE_MS
+// below) far shorter than the scan interval, so once the local AP environment is
+// captured, rescanning adds little. Cap total WiFi scans then end the task so the
+// leak is a bounded one-time cost and the heap stays flat. 0 = unlimited (the
+// old leaky behavior).
+#define ANCHOR_PROX_WIFI_MAX_SCANS           8
 #define ANCHOR_PROX_DEVICE_STALE_MS          10000
 #define ANCHOR_PROX_MAX_FINGERPRINT_DEVICES  128
 #define ANCHOR_NEAR_RSSI_THRESHOLD_DBM       (-70)     // raw-RSSI fallback only
