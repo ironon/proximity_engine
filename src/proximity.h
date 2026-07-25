@@ -87,6 +87,10 @@
 // ProxScoreResult.flags bits.
 #define PROX_FLAG_FINGERPRINT_ACTIVE  0x01u
 #define PROX_FLAG_LOW_DEVICE_COUNT    0x02u
+// Set when the just-scored vector passed the self-supervised training gate and
+// was folded into the fingerprint (§4.10.4). Lets a calibration burst count
+// samples that actually taught the anchor, rather than mere elapsed time.
+#define PROX_FLAG_SAMPLE_ACCEPTED     0x04u
 
 // ============================================================================
 // Shared data structures
@@ -188,7 +192,8 @@ void            prox_ingest_scan_result(const uint8_t mac[6], uint8_t type, int8
 // Score a submitted watch vector against this anchor (Signal A + Signal B).
 ProxScoreResult prox_compute_score(const ProxScanVector* watch_vec);
 // Conditionally fold the vector into the fingerprint (self-supervised).
-void            prox_maybe_update_fingerprint(const ProxScanVector* watch_vec,
+// Returns 1 if the sample passed the training gate and was accepted, else 0.
+int             prox_maybe_update_fingerprint(const ProxScanVector* watch_vec,
                                               ProxScoreResult result);
 // Replace fingerprint + registry from an app-provided blob.
 int             prox_load_fingerprint(const uint8_t* blob, size_t len);

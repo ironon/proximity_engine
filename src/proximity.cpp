@@ -266,11 +266,11 @@ static int sample_is_unambiguous(const ProxScanVector* v) {
     return 1;
 }
 
-void prox_maybe_update_fingerprint(const ProxScanVector* watch_vec, ProxScoreResult result) {
-    if (result.flags & PROX_FLAG_LOW_DEVICE_COUNT) return;
+int prox_maybe_update_fingerprint(const ProxScanVector* watch_vec, ProxScoreResult result) {
+    if (result.flags & PROX_FLAG_LOW_DEVICE_COUNT) return 0;
     float score_f = result.score / 255.0f;
-    if (score_f < PROX_COLLECT_SCORE_THRESHOLD) return;
-    if (!sample_is_unambiguous(watch_vec)) return;
+    if (score_f < PROX_COLLECT_SCORE_THRESHOLD) return 0;
+    if (!sample_is_unambiguous(watch_vec)) return 0;
 
     // Update every registry device; teach "not visible" for absent ones at half weight.
     for (int i = 0; i < g_reg_count; ++i) {
@@ -289,6 +289,7 @@ void prox_maybe_update_fingerprint(const ProxScanVector* watch_vec, ProxScoreRes
         AnchorDev* d = reg_add(pd->mac, pd->type);
         if (d) { d->mu = (float)pd->rssi; dev_welford(d, (float)pd->rssi, score_f); }
     }
+    return 1;
 }
 
 // ---- persistence ----
