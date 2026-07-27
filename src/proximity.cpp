@@ -84,6 +84,14 @@ static uint8_t   g_peer_macs[PROX_MAX_PEER_ANCHORS][6];
 static int       g_peer_count = 0;
 static uint32_t  g_last_persist_ms = 0;
 
+// Calibration-v2 per-anchor threshold (0 = uncalibrated → use global default).
+static uint8_t   g_near_threshold = 0;
+// Calibration-v2 score-distribution collectors (32-bucket histograms, 0..255).
+static uint16_t  g_calib_inside_hist[PROX_CALIB_HIST_BUCKETS];
+static uint16_t  g_calib_edge_hist[PROX_CALIB_HIST_BUCKETS];
+static uint32_t  g_calib_inside_n = 0;
+static uint32_t  g_calib_edge_n   = 0;
+
 static const char* PROX_NVS_KEY = "prox_fp";
 
 static AnchorDev* reg_find(const uint8_t mac[6], uint8_t type) {
@@ -302,18 +310,132 @@ int prox_maybe_update_fingerprint(const ProxScanVector* watch_vec, ProxScoreResu
     return 1;
 }
 
+// ============================================================================
+// Calibration-v2: phase-labeled training + per-anchor threshold
+// ============================================================================
+
+// Fold a vector into the fingerprint under an app-guaranteed label. INSIDE folds
+// at full weight with NO score/RSSI/unambiguous gate (decision 2). EDGE never
+// trains (its scores are only collected via prox_calib_add). Returns 1 if the
+// vector was folded in.
+int prox_train_labeled(const ProxScanVector* v, int is_inside) {
+    if (!is_inside) return 0;          // EDGE: collect scores only, never train
+    if (!v || v->count == 0) return 0;
+    // Update every registry device at full weight; teach "not visible" for
+    // absent ones at half weight (mirrors the passive path, minus the gates).
+    for (int i = 0; i < g_reg_count; ++i) {
+        AnchorDev* d = &g_reg[i];
+        if (!d->in_use) continue;
+        int8_t x;
+        if (vec_lookup(v, d->mac, d->type, &x))
+            dev_welford(d, (float)x, 1.0f);
+        else
+            dev_welford(d, (float)PROX_MISSING_RSSI_DBM, 0.5f);
+    }
+    // Register + seed any newly-seen devices at full weight.
+    for (int i = 0; i < v->count; ++i) {
+        const ProxDevice* pd = &v->devices[i];
+        if (reg_find(pd->mac, pd->type)) continue;
+        AnchorDev* d = reg_add(pd->mac, pd->type);
+        if (d) { d->mu = (float)pd->rssi; dev_welford(d, (float)pd->rssi, 1.0f); }
+    }
+    return 1;
+}
+
+void prox_calib_reset(void) {
+    memset(g_calib_inside_hist, 0, sizeof(g_calib_inside_hist));
+    memset(g_calib_edge_hist,   0, sizeof(g_calib_edge_hist));
+    g_calib_inside_n = 0;
+    g_calib_edge_n   = 0;
+}
+
+void prox_calib_add(int is_inside, uint8_t score) {
+    int b = score / PROX_CALIB_BUCKET_WIDTH;
+    if (b >= PROX_CALIB_HIST_BUCKETS) b = PROX_CALIB_HIST_BUCKETS - 1;
+    if (is_inside) {
+        g_calib_inside_hist[b]++;
+        if (g_calib_inside_n < 0xFFFFu) g_calib_inside_n++;
+    } else {
+        g_calib_edge_hist[b]++;
+        if (g_calib_edge_n < 0xFFFFu) g_calib_edge_n++;
+    }
+}
+
+// Score at the given percentile (0..100) from a histogram; returns the bucket
+// center (0..255). n is the total count that produced the histogram.
+static uint8_t histo_percentile(const uint16_t* h, uint32_t n, int pct) {
+    if (n == 0) return 0;
+    uint32_t target = ((uint64_t)n * (uint32_t)pct + 99u) / 100u; // ceil(n*pct/100)
+    if (target == 0) target = 1;
+    uint32_t cum = 0;
+    for (int b = 0; b < PROX_CALIB_HIST_BUCKETS; ++b) {
+        cum += h[b];
+        if (cum >= target)
+            return (uint8_t)(b * PROX_CALIB_BUCKET_WIDTH + PROX_CALIB_BUCKET_WIDTH / 2);
+    }
+    return 255;
+}
+
+uint8_t prox_calib_finalize(uint16_t* inside_n, uint16_t* edge_n, uint8_t* confidence) {
+    uint16_t in_n = (uint16_t)g_calib_inside_n;
+    uint16_t ed_n = (uint16_t)g_calib_edge_n;
+    uint8_t thr, conf;
+
+    if (g_calib_inside_n < PROX_CALIB_MIN_SAMPLES || g_calib_edge_n < PROX_CALIB_MIN_SAMPLES) {
+        // Not enough demonstrated samples to trust a learned cutoff.
+        thr  = PROX_CONFIDENCE_THRESHOLD_U8;
+        conf = 0;
+    } else {
+        uint8_t inside_p10 = histo_percentile(g_calib_inside_hist, g_calib_inside_n, 10);
+        uint8_t edge_p90   = histo_percentile(g_calib_edge_hist,   g_calib_edge_n,   90);
+        int cand = (int)edge_p90 + PROX_CALIB_THRESHOLD_MARGIN_U8; // just above edge top
+        if (cand > 255) cand = 255;
+        if ((int)inside_p10 > cand) {
+            // Clean separation: cutoff sits in the gap, below the inside floor.
+            thr = (uint8_t)cand;
+            int gap = (int)inside_p10 - cand;      // width of the confidence margin
+            int c = gap * 4; if (c > 255) c = 255; // ~64 score-units of gap → full
+            conf = (uint8_t)c;
+        } else {
+            // Overlap (edge scores reach into the inside scores) — bad demo.
+            thr  = PROX_CONFIDENCE_THRESHOLD_U8;
+            conf = 0;
+        }
+    }
+
+    if (inside_n)   *inside_n = in_n;
+    if (edge_n)     *edge_n = ed_n;
+    if (confidence) *confidence = conf;
+    prox_calib_reset();
+    return thr;
+}
+
+void prox_set_near_threshold(uint8_t thr) {
+    g_near_threshold = thr;
+    g_last_persist_ms = 0; // force a persist on the next due check
+}
+
+uint8_t prox_get_near_threshold(void) { return g_near_threshold; }
+
 // ---- persistence ----
 // Internal NVS blob keeps full Welford state (mu, M, W) so accumulation resumes
-// across reboots: [2 count][per dev: 6 mac, 1 type, 4 mu, 4 M, 4 W].
-#define PROX_NVS_REC 19
+// across reboots. Calibration-v2 versions the blob:
+//   v1: [1 version=1][1 near_threshold][2 count][per dev: 6 mac,1 type,4 mu,4 M,4 W]
+//   v0 (legacy): [2 count][per dev: ...]   ← read as version 0, near_threshold 0
+// Version is detected from byte 0: v1 stamps 0x01 there; the legacy format's
+// byte 0 is the low byte of the device count and is only 0x01 for the (invalid,
+// sub-min-device) count==1 case, so 0x01 unambiguously marks v1 in practice.
+#define PROX_NVS_REC     19
+#define PROX_NVS_VERSION 1
+#define PROX_NVS_HDR     4   // [ver][thr][count u16]
 
 void prox_persist_if_due(void) {
     uint32_t now = prox_platform_now_ms();
     if (g_last_persist_ms != 0 && (now - g_last_persist_ms) < (uint32_t)PROX_NVS_PERSIST_INTERVAL_S * 1000u) return;
     g_last_persist_ms = now;
 
-    static uint8_t buf[2 + ANCHOR_PROX_MAX_FINGERPRINT_DEVICES * PROX_NVS_REC];
-    int n = 0; size_t off = 2;
+    static uint8_t buf[PROX_NVS_HDR + ANCHOR_PROX_MAX_FINGERPRINT_DEVICES * PROX_NVS_REC];
+    int n = 0; size_t off = PROX_NVS_HDR;
     for (int i = 0; i < g_reg_count; ++i) {
         AnchorDev* d = &g_reg[i];
         if (!d->in_use) continue;
@@ -324,15 +446,24 @@ void prox_persist_if_due(void) {
         wr_f32(buf + off, d->W);  off += 4;
         n++;
     }
-    wr_u16(buf, (uint16_t)n);
+    buf[0] = PROX_NVS_VERSION;
+    buf[1] = g_near_threshold;
+    wr_u16(buf + 2, (uint16_t)n);
     prox_platform_nvs_save(PROX_NVS_KEY, buf, off);
 }
 
 static void prox_load_from_nvs(void) {
-    static uint8_t buf[2 + ANCHOR_PROX_MAX_FINGERPRINT_DEVICES * PROX_NVS_REC];
+    static uint8_t buf[PROX_NVS_HDR + ANCHOR_PROX_MAX_FINGERPRINT_DEVICES * PROX_NVS_REC];
     size_t len = 0;
     if (!prox_platform_nvs_load(PROX_NVS_KEY, buf, sizeof(buf), &len) || len < 2) return;
-    int n = rd_u16(buf); size_t off = 2;
+    int n; size_t off;
+    if (buf[0] == PROX_NVS_VERSION && len >= PROX_NVS_HDR) {
+        g_near_threshold = buf[1];
+        n = rd_u16(buf + 2); off = PROX_NVS_HDR;
+    } else {
+        g_near_threshold = 0;              // legacy blob: uncalibrated
+        n = rd_u16(buf); off = 2;
+    }
     g_reg_count = 0;
     for (int i = 0; i < n && off + PROX_NVS_REC <= len; ++i) {
         AnchorDev* d = &g_reg[g_reg_count++];
@@ -662,6 +793,8 @@ void prox_init(void) {
 #ifdef PROXIMITY_ROLE_ANCHOR
     g_reg_count = 0;
     g_last_persist_ms = 0;
+    g_near_threshold = 0;
+    prox_calib_reset();
     prox_load_from_nvs();
 #endif
 #ifdef PROXIMITY_ROLE_WATCH

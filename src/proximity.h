@@ -48,8 +48,27 @@
 #define ANCHOR_PROX_WIFI_MAX_SCANS           8
 #define ANCHOR_PROX_DEVICE_STALE_MS          10000
 #define ANCHOR_PROX_MAX_FINGERPRINT_DEVICES  128
-#define ANCHOR_NEAR_RSSI_THRESHOLD_DBM       (-85)     // raw-RSSI fallback only
+// Passive (phase==NONE) self-supervised training gate only. Calibration-v2 no
+// longer bootstraps NEAR labels from RSSI (phases are app-demonstrated); this
+// strict value keeps passive refinement from ever widening a demonstrated zone.
+#define ANCHOR_NEAR_RSSI_THRESHOLD_DBM       (-68)     // raw-RSSI fallback only (passive)
 #define PROX_MAX_PEER_ANCHORS                16
+
+// ── Calibration-v2: per-anchor demonstrated near-zone threshold ──────────────
+// Score-distribution collectors (INSIDE vs EDGE) fed during calibration; a
+// 32-bucket histogram over 0..255 (8 counts/bucket) gives cheap p10/p90.
+#define PROX_CALIB_HIST_BUCKETS              32
+#define PROX_CALIB_BUCKET_WIDTH              (256 / PROX_CALIB_HIST_BUCKETS)   // 8
+// Cutoff sits just above the top of the EDGE scores (edge_p90 + MARGIN), but is
+// only accepted if it stays below the INSIDE floor (inside_p10) — else the two
+// distributions overlap (bad demo) and we fall back to the global default and
+// flag low confidence (decision 3).
+#define PROX_CALIB_THRESHOLD_MARGIN_U8       8
+#define PROX_CALIB_MIN_SAMPLES               5
+// Hysteresis band below a calibrated per-anchor threshold: scores in
+// [near_threshold - HYST, near_threshold) read AMBIGUOUS (resolved to the
+// fail-safe-compliant/AWAY side by callers). Decision 4.
+#define PROX_NEAR_HYST_U8                    20
 
 // ── Modes B/C: co-location ───────────────────────────────────────────────────
 #define COLOC_EWMA_ALPHA                     0.30f
@@ -214,6 +233,24 @@ void            prox_set_self_mac(const uint8_t mac[6]);
 // Optional: tell this anchor the MACs of peer anchors, so the self-supervised
 // training gate can reject boundary samples that are ambiguous between anchors.
 void            prox_set_peer_anchor_macs(const uint8_t macs[][6], int count);
+
+// ---- Calibration-v2 (anchor side) ----
+// Phase-labeled training: fold the vector into the fingerprint at full weight,
+// skipping the score/RSSI/unambiguous gates entirely (the app guarantees the
+// INSIDE label). EDGE (is_inside==0) never trains. Returns 1 if accepted.
+int             prox_train_labeled(const ProxScanVector* v, int is_inside);
+// Calibration score-distribution collectors. reset() clears both histograms;
+// add() records one score into the INSIDE or EDGE histogram; finalize() computes
+// the per-anchor near_threshold (decision 3), returns it, reports sample counts
+// and a 0..255 confidence (0 = overlap/insufficient → low), and clears the
+// collectors.
+void            prox_calib_reset(void);
+void            prox_calib_add(int is_inside, uint8_t score);
+uint8_t         prox_calib_finalize(uint16_t* inside_n, uint16_t* edge_n, uint8_t* confidence);
+// Per-anchor decision threshold in score space (0 = uncalibrated → use global
+// PROX_CONFIDENCE_THRESHOLD_U8). Persisted alongside the fingerprint NVS blob.
+void            prox_set_near_threshold(uint8_t thr);
+uint8_t         prox_get_near_threshold(void);
 #endif
 
 // ---- Mode A: watch side ----
