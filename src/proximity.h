@@ -48,7 +48,7 @@
 #define ANCHOR_PROX_WIFI_MAX_SCANS           8
 #define ANCHOR_PROX_DEVICE_STALE_MS          10000
 #define ANCHOR_PROX_MAX_FINGERPRINT_DEVICES  128
-#define ANCHOR_NEAR_RSSI_THRESHOLD_DBM       (-70)     // raw-RSSI fallback only
+#define ANCHOR_NEAR_RSSI_THRESHOLD_DBM       (-85)     // raw-RSSI fallback only
 #define PROX_MAX_PEER_ANCHORS                16
 
 // ── Modes B/C: co-location ───────────────────────────────────────────────────
@@ -195,6 +195,13 @@ ProxScoreResult prox_compute_score(const ProxScanVector* watch_vec);
 // Returns 1 if the sample passed the training gate and was accepted, else 0.
 int             prox_maybe_update_fingerprint(const ProxScanVector* watch_vec,
                                               ProxScoreResult result);
+// Diagnostics for the last prox_maybe_update_fingerprint() decision:
+// reason — 0 accepted · 1 low-device-count · 2 score-below-threshold ·
+//          3 self-MAC-not-in-vector · 4 self-too-far (rssi < near threshold) ·
+//          5 ambiguous (a peer anchor was comparably close).
+// self_rssi — the anchor's own RSSI as found in that vector (0 = not found).
+int             prox_last_train_reason(void);
+int8_t          prox_last_self_rssi(void);
 // Replace fingerprint + registry from an app-provided blob.
 int             prox_load_fingerprint(const uint8_t* blob, size_t len);
 // Deserialize a watch scan vector from the wire format the watch produces with

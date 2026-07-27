@@ -249,27 +249,36 @@ static void dev_welford(AnchorDev* d, float x, float w) {
     dev_recache(d);
 }
 
+// Diagnostics for the last training decision (see prox_last_train_reason).
+static int    g_last_train_reason = -1;
+static int8_t g_last_self_rssi    = 0;
+int    prox_last_train_reason(void) { return g_last_train_reason; }
+int8_t prox_last_self_rssi(void)    { return g_last_self_rssi; }
+
 // Is the sample unambiguous? Requires self present and beating any known peer
 // anchor by PROX_COLLECT_AMBIGUITY_MARGIN_DBM. If no peers are known, the self
-// presence + reasonable-strength gate is used (see spec §2.5 / §4).
+// presence + reasonable-strength gate is used (see spec §2.5 / §4). Sets the
+// training-reason diagnostics on failure.
 static int sample_is_unambiguous(const ProxScanVector* v) {
-    if (!g_have_self) return 0;
+    if (!g_have_self) { g_last_train_reason = 3; return 0; }
     int8_t self_rssi;
-    if (!vec_lookup(v, g_self_mac, PROX_TYPE_BLE, &self_rssi)) return 0;
-    if (self_rssi < ANCHOR_NEAR_RSSI_THRESHOLD_DBM) return 0;
+    if (!vec_lookup(v, g_self_mac, PROX_TYPE_BLE, &self_rssi)) { g_last_train_reason = 3; return 0; }
+    g_last_self_rssi = self_rssi;
+    if (self_rssi < ANCHOR_NEAR_RSSI_THRESHOLD_DBM) { g_last_train_reason = 4; return 0; }
     for (int i = 0; i < g_peer_count; ++i) {
         int8_t peer_rssi;
         if (vec_lookup(v, g_peer_macs[i], PROX_TYPE_BLE, &peer_rssi))
             if (peer_rssi >= self_rssi - PROX_COLLECT_AMBIGUITY_MARGIN_DBM)
-                return 0; // a rival anchor is comparably close → boundary sample
+                { g_last_train_reason = 5; return 0; } // rival anchor comparably close
     }
     return 1;
 }
 
 int prox_maybe_update_fingerprint(const ProxScanVector* watch_vec, ProxScoreResult result) {
-    if (result.flags & PROX_FLAG_LOW_DEVICE_COUNT) return 0;
+    g_last_self_rssi = 0;
+    if (result.flags & PROX_FLAG_LOW_DEVICE_COUNT) { g_last_train_reason = 1; return 0; }
     float score_f = result.score / 255.0f;
-    if (score_f < PROX_COLLECT_SCORE_THRESHOLD) return 0;
+    if (score_f < PROX_COLLECT_SCORE_THRESHOLD) { g_last_train_reason = 2; return 0; }
     if (!sample_is_unambiguous(watch_vec)) return 0;
 
     // Update every registry device; teach "not visible" for absent ones at half weight.
@@ -289,6 +298,7 @@ int prox_maybe_update_fingerprint(const ProxScanVector* watch_vec, ProxScoreResu
         AnchorDev* d = reg_add(pd->mac, pd->type);
         if (d) { d->mu = (float)pd->rssi; dev_welford(d, (float)pd->rssi, score_f); }
     }
+    g_last_train_reason = 0; // accepted
     return 1;
 }
 
