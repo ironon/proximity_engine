@@ -16,6 +16,7 @@
 // one exp. See feature_cache() and the AnchorDev cached fields.
 
 #include "proximity.h"
+#include "prox_luts.h"
 #include <math.h>
 #include <string.h>
 
@@ -567,38 +568,527 @@ size_t prox_serialize_vector(const ProxScanVector* v, uint8_t* out, size_t cap) 
 #endif // PROXIMITY_ROLE_WATCH
 
 // ============================================================================
+// v2.1 PHASE 1 — MOTION CHANNEL, MOTION-GATED INTEGRATOR, HMM (watch side)
+//
+// Engine spec v2.1 §4 and §6; FIRMWARE_SPEC v0.9 amendment Parts 9, 10, 14.
+//
+// Why this exists: indoor RSSI is flat not because distance is unmeasurable but
+// because a *stationary* receiver sees exactly one small-scale fading draw per
+// frequency, forever. Averaging longer does not add information — it only adds
+// confidence in whatever fade the wrist happens to be parked in (spec §1.2).
+// So the engine (a) counts independent draws honestly instead of samples, and
+// (b) refuses to change its mind while the IMU says the wrist could not have
+// moved. Everything below is integer math: the C3 has no FPU and this runs on
+// every enforcement poll (§7).
+// ============================================================================
+#ifdef PROXIMITY_ROLE_WATCH
+
+// ---- Q8 fixed-point transcendental substitutes (all LUT-driven) ------------
+
+// log2(x) in Q8 for x >= 1. Exponent from a leading-zero count, mantissa from
+// the 64-entry table — no libm, no float.
+static int32_t q8_log2_u32(uint32_t x) {
+    if (x == 0) return 0;
+    int e = 31 - __builtin_clz(x);
+    uint32_t frac = (e >= 6) ? ((x >> (e - 6)) & 63u) : ((x << (6 - e)) & 63u);
+    return ((int32_t)e << 8) + (int32_t)PROX_LUT_LOG2_MANT[frac];
+}
+
+// ln(x) in Q8 for x >= 1.  ln x = log2(x) * ln2, 181 = round(0.693147 * 256).
+static int32_t q8_ln_u32(uint32_t x) {
+    return (int32_t)(((int64_t)q8_log2_u32(x) * 181) >> 8);
+}
+
+// log(e^a + e^b) in Q8: max + log(1 + e^-|a-b|) from the tail table.
+static int32_t q8_lse(int32_t a, int32_t b) {
+    int32_t hi = a > b ? a : b;
+    int32_t lo = a > b ? b : a;
+    int32_t k  = (hi - lo) >> 5;              // 1/8-nat steps
+    if (k >= 64) return hi;                   // tail below Q8 resolution
+    return hi + (int32_t)PROX_LUT_LSE_CORR[k];
+}
+
+static inline int32_t clamp_i32(int32_t x, int32_t lo, int32_t hi) {
+    return x < lo ? lo : (x > hi ? hi : x);
+}
+
+// ---- Motion channel (§4.1) -------------------------------------------------
+//
+// Three inputs, none of which costs a new interrupt source: the ENFORCEMENT-only
+// IA1 wake verdict over each light-sleep interval, IA1 firings while awake, and
+// one short accelerometer burst sampled *while the radio scans* (the CPU is
+// idle there anyway). DORMANT's v0.7 zero-IMU-interrupt guarantee is untouched —
+// nothing here runs outside ENFORCEMENT and calibration bursts.
+
+static uint8_t  g_motion_state      = PROX_MOTION_UNKNOWN;
+static uint32_t g_motion_evidence_ms = 0;   // clock of the newest motion evidence
+static uint32_t g_motion_burst_var   = 0;   // last burst variance, mg^2
+static uint8_t  g_motion_cadence     = 0;   // last burst showed step cadence
+static uint8_t  g_motion_ints        = 0;   // IA1 firings since the last burst
+static uint8_t  g_motion_have_sleep  = 0;   // a sleep interval has been reported
+static uint8_t  g_motion_sleep_still = 0;   // ...and it was motionless
+
+static void motion_reset(void) {
+    g_motion_state       = PROX_MOTION_UNKNOWN;
+    g_motion_evidence_ms = 0;
+    g_motion_burst_var   = 0;
+    g_motion_cadence     = 0;
+    g_motion_ints        = 0;
+    g_motion_have_sleep  = 0;
+    g_motion_sleep_still = 0;
+}
+
+// Classify from whatever evidence is current (§4.1 table). Order matters: the
+// LOCOMOTION tests come first so an ambiguous burst can never mask real motion.
+static void motion_classify(void) {
+    if (g_motion_cadence || g_motion_burst_var > (uint32_t)IMU_LOCO_VAR ||
+        g_motion_ints >= IMU_LOCO_MIN_INTS) {
+        g_motion_state = PROX_MOTION_LOCOMOTION;
+        return;
+    }
+    // STILL needs *positive* stillness evidence: a quiet burst, no awake IA1
+    // firing, and no sleep interval that was broken by motion.
+    if (g_motion_burst_var < (uint32_t)IMU_STILL_VAR && g_motion_ints == 0 &&
+        (!g_motion_have_sleep || g_motion_sleep_still)) {
+        g_motion_state = PROX_MOTION_STILL;
+        return;
+    }
+    g_motion_state = PROX_MOTION_FIDGET;
+}
+
+void prox_ingest_imu_burst(const int16_t (*xyz)[3], uint16_t n, uint16_t hz) {
+    (void)hz;   // cadence is expressed in samples; hz only scales the reported band
+    if (!xyz || n < 4) return;
+
+    // Gravity removal is the burst's own per-axis mean: over ~0.6 s the DC term
+    // is the gravity vector in whatever orientation the wrist is holding.
+    int32_t sum[3] = {0, 0, 0};
+    for (uint16_t i = 0; i < n; ++i)
+        for (int a = 0; a < 3; ++a) sum[a] += xyz[i][a];
+    int32_t mean[3] = { sum[0] / (int32_t)n, sum[1] / (int32_t)n, sum[2] / (int32_t)n };
+
+    // Variance summed over the three axes (mg^2), plus a scalar motion magnitude
+    // per sample for the cadence test (alpha-max-beta-min, no sqrt).
+    uint64_t ss = 0;
+    int32_t  mag[IMU_BURST_SAMPLES];
+    uint16_t nm = n > IMU_BURST_SAMPLES ? IMU_BURST_SAMPLES : n;
+    int32_t  magsum = 0;
+    for (uint16_t i = 0; i < n; ++i) {
+        int32_t d0 = xyz[i][0] - mean[0];
+        int32_t d1 = xyz[i][1] - mean[1];
+        int32_t d2 = xyz[i][2] - mean[2];
+        ss += (uint64_t)(d0 * d0 + d1 * d1 + d2 * d2);
+        if (i < nm) {
+            int32_t a0 = d0 < 0 ? -d0 : d0, a1 = d1 < 0 ? -d1 : d1, a2 = d2 < 0 ? -d2 : d2;
+            int32_t mx = a0 > a1 ? a0 : a1; if (a2 > mx) mx = a2;
+            int32_t mn = a0 < a1 ? a0 : a1; if (a2 < mn) mn = a2;
+            mag[i] = mx + (mn >> 1);          // ~ magnitude, cheap
+            magsum += mag[i];
+        }
+    }
+    uint32_t var = (uint32_t)(ss / n);
+
+    // Step cadence: sign changes of the mean-removed magnitude envelope. At
+    // IMU_BURST_SAMPLES / IMU_BURST_HZ seconds of signal a 0.5-3 Hz gait shows a
+    // small, bounded number of crossings; noise-driven crossings are excluded by
+    // the variance floor.
+    int32_t magmean = magsum / (int32_t)nm;
+    int crossings = 0, prev = 0;
+    for (uint16_t i = 0; i < nm; ++i) {
+        int s = (mag[i] > magmean) ? 1 : -1;
+        if (prev != 0 && s != prev) crossings++;
+        prev = s;
+    }
+    g_motion_cadence = (var >= (uint32_t)IMU_CADENCE_MIN_VAR &&
+                        crossings >= IMU_CADENCE_MIN_CROSSINGS &&
+                        crossings <= IMU_CADENCE_MAX_CROSSINGS) ? 1u : 0u;
+
+    g_motion_burst_var   = var;
+    g_motion_evidence_ms = prox_platform_now_ms();
+    motion_classify();
+    g_motion_ints       = 0;   // consumed by this classification
+    g_motion_have_sleep = 0;   // the burst supersedes the sleep verdict
+}
+
+void prox_note_motion_interrupt(void) {
+    if (g_motion_ints < 255) g_motion_ints++;
+    g_motion_evidence_ms = prox_platform_now_ms();
+    // Promote immediately — the wrist demonstrably moved, and waiting for the
+    // next burst to say so would leave the HMM locked exactly when it must open.
+    if (g_motion_ints >= IMU_LOCO_MIN_INTS)      g_motion_state = PROX_MOTION_LOCOMOTION;
+    else if (g_motion_state == PROX_MOTION_STILL) g_motion_state = PROX_MOTION_FIDGET;
+}
+
+void prox_note_sleep_interval(uint32_t slept_ms, int motion_woke) {
+    (void)slept_ms;
+    g_motion_have_sleep  = 1;
+    g_motion_sleep_still = motion_woke ? 0u : 1u;
+    g_motion_evidence_ms = prox_platform_now_ms();
+    if (motion_woke) {
+        if (g_motion_ints < 255) g_motion_ints++;
+        if (g_motion_state == PROX_MOTION_STILL) g_motion_state = PROX_MOTION_FIDGET;
+    } else {
+        // A whole sleep interval with no IA1 is the strongest and cheapest STILL
+        // evidence there is; it carries the previous STILL verdict across the
+        // sleep instead of letting it go stale (which would read as LOCOMOTION).
+        if (g_motion_state == PROX_MOTION_STILL) g_motion_burst_var = 0;
+        g_motion_ints = 0;
+    }
+}
+
+uint32_t prox_motion_burst_var(void)     { return g_motion_burst_var; }
+uint8_t  prox_motion_burst_cadence(void) { return g_motion_cadence; }
+
+uint8_t prox_motion_state(void) {
+    if (g_motion_evidence_ms == 0) return PROX_MOTION_UNKNOWN;
+    if (prox_platform_now_ms() - g_motion_evidence_ms > (uint32_t)IMU_STALE_MS)
+        return PROX_MOTION_UNKNOWN;      // stale seam ⇒ fail toward v0.8 behavior
+    return g_motion_state;
+}
+
+// Independent draws credited over dt_ms at the current motion state, in Q12.
+// Q12 rather than the public Q4 because the STILL rate is deliberately far below
+// one draw per tick and the remainder has to survive across ticks.
+static uint32_t motion_credit_q12(uint32_t dt_ms) {
+    uint64_t c;
+    switch (prox_motion_state()) {
+        case PROX_MOTION_STILL:
+            c = ((uint64_t)4096u * dt_ms) / ((uint64_t)HMM_STILL_DRAW_PERIOD_S * 1000u);
+            break;
+        case PROX_MOTION_FIDGET:
+            c = ((uint64_t)NEFF_FIDGET_PER_S * 4096u * dt_ms) / 1000u;
+            break;
+        default:                                              // LOCOMOTION / UNKNOWN
+            c = ((uint64_t)NEFF_LOCO_PER_S * 4096u * dt_ms) / 1000u;
+            break;
+    }
+    uint64_t cap = (uint64_t)NEFF_MAX_Q4 << 8;
+    return (uint32_t)(c > cap ? cap : c);
+}
+
+uint16_t prox_motion_neff_credit_q4(uint32_t dt_ms) {
+    return (uint16_t)(motion_credit_q12(dt_ms) >> 8);
+}
+
+// ---- Motion-gated integrator (§4.2) ---------------------------------------
+
+void prox_integ_reset(ProxIntegrator* it) {
+    if (!it) return;
+    memset(it, 0, sizeof(*it));
+    it->var_q8      = (int32_t)INTEG_SINGLE_DRAW_VAR << 8;
+    it->last_motion = PROX_MOTION_UNKNOWN;
+}
+
+static void integ_prime(ProxIntegrator* it, int32_t x_q8, uint32_t now, uint8_t ms) {
+    it->mean_q8     = x_q8;
+    it->var_q8      = (int32_t)INTEG_SINGLE_DRAW_VAR << 8;
+    it->neff_q4     = NEFF_FLOOR_NOSCHED_Q4;
+    it->primed      = 1;
+    it->last_motion = ms;
+    it->last_ms     = now;
+}
+
+void prox_integ_update(ProxIntegrator* it, int32_t x_q8) {
+    if (!it) return;
+    uint32_t now = prox_platform_now_ms();
+    uint8_t  ms  = prox_motion_state();
+    if (ms == PROX_MOTION_UNKNOWN) ms = PROX_MOTION_LOCOMOTION;  // fail toward v1
+
+    if (!it->primed) { integ_prime(it, x_q8, now, ms); return; }
+
+    // STILL -> LOCOMOTION: window restart. Position may now be changing, and
+    // evidence gathered while parked must not outvote what is arriving fresh.
+    if (it->last_motion == PROX_MOTION_STILL && ms == PROX_MOTION_LOCOMOTION) {
+        integ_prime(it, x_q8, now, ms);
+        return;
+    }
+
+    uint32_t dt = now - it->last_ms;
+    int32_t  w  = (ms == PROX_MOTION_STILL) ? INTEG_STILL_WEIGHT : INTEG_MOVE_WEIGHT;
+    int32_t  d  = x_q8 - it->mean_q8;
+
+    it->mean_q8 += (d * w) >> 8;
+
+    if (ms != PROX_MOTION_STILL) {
+        // Residuals between genuinely independent draws are what variance means.
+        int32_t inst = (d * d) >> 8;                // residual^2, Q8 of dB^2
+        it->var_q8  += ((inst - it->var_q8) * w) >> 8;
+    }
+
+    if (ms == PROX_MOTION_STILL) {
+        // N_eff frozen: more samples of one fading draw are not more information.
+        if (it->neff_q4 < NEFF_FLOOR_NOSCHED_Q4) it->neff_q4 = NEFF_FLOOR_NOSCHED_Q4;
+        // ...and the reported variance relaxes back toward a single draw. A still
+        // receiver's near-zero residuals are not evidence of a tight estimate —
+        // they are evidence that nothing has been re-sampled — so the variance is
+        // never allowed to shrink on them, only to relax back outward.
+        int32_t target = (int32_t)INTEG_SINGLE_DRAW_VAR << 8;
+        if (it->var_q8 < target) {
+            int32_t f = (int32_t)(((uint64_t)dt * 256u) / ((uint32_t)INTEG_STILL_RELAX_S * 1000u));
+            if (f > 256) f = 256;
+            it->var_q8 += ((target - it->var_q8) * f) >> 8;
+        }
+    } else {
+        uint32_t n = (uint32_t)it->neff_q4 + prox_motion_neff_credit_q4(dt);
+        it->neff_q4 = (uint16_t)(n > NEFF_MAX_Q4 ? NEFF_MAX_Q4 : n);
+    }
+
+    it->last_motion = ms;
+    it->last_ms     = now;
+}
+
+int prox_integ_mean_q8(const ProxIntegrator* it, int32_t* out) {
+    if (!it || !it->primed) return 0;
+    if (out) *out = it->mean_q8;
+    return 1;
+}
+
+int prox_integ_var_q8(const ProxIntegrator* it, int32_t* out) {
+    if (!it || !it->primed) return 0;
+    if (out) *out = it->var_q8;
+    return 1;
+}
+
+uint8_t prox_integ_neff(const ProxIntegrator* it) {
+    if (!it || !it->primed) return 0;
+    uint32_t n = it->neff_q4 >> 4;
+    return (uint8_t)(n > 255 ? 255 : n);
+}
+
+// ---- Two-state motion-conditioned HMM (§6) --------------------------------
+//
+// The whole filter is one scalar: Lambda = log( P(NEAR) / P(AWAY) ) in Q8.
+// With two states the forward algorithm collapses to
+//     Lambda' = lse(Lambda, -c) - lse(Lambda - c, 0),   c = ln((1-p)/p)
+// which is exact, needs two table lookups, and saturates at |Lambda| = c — i.e.
+// the transition model itself imposes the ceiling on how certain a filter with
+// flip probability p is allowed to become.
+
+static int32_t  g_hmm_lam_q8   = 0;
+static int32_t  g_hmm_local_q8 = 0;   // pending watch-local evidence for next tick
+static uint32_t g_hmm_last_ms  = 0;   // clock at the previous transition step
+static uint32_t g_hmm_emit_ms  = 0;   // clock at the previous *emission*
+static uint8_t  g_hmm_primed   = 0;
+static uint8_t  g_hmm_first    = 1;   // no emission has been folded in yet
+static uint32_t g_hmm_draw_resid_q12 = 0;  // fractional draws carried between ticks
+static int32_t  g_hmm_still_credited_q8 = 0;  // evidence already granted in this still window
+
+// One transition step for a flip probability expressed in ppm.
+static int32_t hmm_transition(int32_t lam_q8, uint32_t pflip_ppm) {
+    if (pflip_ppm == 0) return lam_q8;
+    if (pflip_ppm >= HMM_PFLIP_MAX_PPM) return 0;      // fully mixed: no memory
+    int32_t c = q8_ln_u32(1000000u - pflip_ppm) - q8_ln_u32(pflip_ppm);
+    return q8_lse(lam_q8, -c) - q8_lse(lam_q8 - c, 0);
+}
+
+// Flip probability for this motion state, linearly scaled to the elapsed time
+// (ticks are irregular: 60 s, 180 s, 600 s, or an instant motion re-check).
+static uint32_t hmm_pflip_ppm(uint8_t ms, uint32_t dt_ms) {
+    uint32_t base;
+    switch (ms) {
+        case PROX_MOTION_STILL:  base = HMM_PFLIP_STILL_PPM;  break;
+        case PROX_MOTION_FIDGET: base = HMM_PFLIP_FIDGET_PPM; break;
+        default:                 base = HMM_PFLIP_MOVE_PPM;   break;  // LOCO / UNKNOWN
+    }
+    uint64_t p = ((uint64_t)base * dt_ms) / ((uint64_t)HMM_TICK_REF_S * 1000u);
+    return (uint32_t)(p > HMM_PFLIP_MAX_PPM ? HMM_PFLIP_MAX_PPM : p);
+}
+
+static void hmm_advance(uint32_t now) {
+    if (!g_hmm_primed) { g_hmm_last_ms = now; g_hmm_primed = 1; return; }
+    uint32_t dt = now - g_hmm_last_ms;
+    if (dt == 0) return;
+    g_hmm_last_ms = now;
+    g_hmm_lam_q8  = hmm_transition(g_hmm_lam_q8, hmm_pflip_ppm(prox_motion_state(), dt));
+}
+
+static ProxDecision hmm_decide(void) {
+    if (g_hmm_lam_q8 >= HMM_TAU_NEAR_Q8) return PROX_HMM_NEAR;
+    if (g_hmm_lam_q8 <= HMM_TAU_AWAY_Q8) return PROX_HMM_AWAY;
+    return PROX_HMM_AMBIGUOUS;
+}
+
+void prox_hmm_reset(uint8_t criterion) {
+    // Cold start biased to the criterion-satisfying state at P = 0.65: the
+    // engine holds no cross-window state, and an uninformed window must not
+    // begin by enforcing (§2, §6.3).
+    g_hmm_lam_q8   = (criterion == PROX_CRIT_STAY_NEAR) ? HMM_PRIOR_Q8 : -HMM_PRIOR_Q8;
+    g_hmm_local_q8 = 0;
+    g_hmm_last_ms  = prox_platform_now_ms();
+    g_hmm_emit_ms  = g_hmm_last_ms;
+    g_hmm_primed   = 1;
+    g_hmm_first    = 1;
+    g_hmm_draw_resid_q12 = 0;
+    g_hmm_still_credited_q8 = 0;
+    motion_reset();                      // motion state UNKNOWN until the first burst
+}
+
+// Weight for this tick's emission, Q8 — the crux of the whole v2 design.
+//
+// Evidence is counted in *independent fading draws*, never in samples. Since the
+// last emission the wrist has earned motion_credit_q12() draws (fractions carry
+// forward in g_hmm_draw_resid_q12); the gain is sqrt(min(1, draws / NEFF_TRAIN_MIN))
+// from the LUT. Consequences:
+//
+//   - A tick that earned no draw contributes NO evidence, so re-measuring a
+//     frozen fade a thousand times is worth exactly as much as measuring it
+//     once. That is what makes an RSSI excursion while the wrist is provably
+//     still structurally incapable of flipping the decision (§6.2). A transition
+//     prior alone could never achieve this: a repeated emission always
+//     overwhelms a prior eventually.
+//   - Not "never", though: HMM_STILL_DRAW_PERIOD_S concedes one draw per 12 h of
+//     unbroken stillness, so sustained contradiction still wins in the end.
+//   - Any tick taken while the wrist is moving is worth at least one draw, so
+//     rapid motion-triggered re-checks stay fully responsive.
+//
+// Returns 0 when this tick brought no fresh draw — the caller then treats the
+// still window's evidence as a level rather than an increment.
+static uint32_t hmm_earn_draws(uint32_t dt_ms) {
+    g_hmm_draw_resid_q12 += motion_credit_q12(dt_ms);
+
+    uint32_t draws = g_hmm_draw_resid_q12 >> 12;
+    if (draws) {
+        g_hmm_draw_resid_q12 -= draws << 12;        // spend what was earned
+    } else if (g_hmm_first || prox_motion_state() != PROX_MOTION_STILL) {
+        draws = 1;                                  // a look taken in motion is a look
+        g_hmm_draw_resid_q12 = 0;
+    }
+    return draws;
+}
+
+void prox_note_connect_failure(int8_t last_advert_rssi_dbm, int have_advert) {
+    // Advertisement receivable but the link will not close ⇒ far. Without a
+    // recent advertisement there is no evidence either way, so abstain rather
+    // than guess (the connect could have failed for a dozen local reasons).
+    if (have_advert && last_advert_rssi_dbm <= PROX_FAR_RSSI_THRESHOLD_DBM)
+        g_hmm_local_q8 += LL_CONNFAIL_AWAY_Q8;
+}
+
+// Fold one emission (already in Q8 log-LR, un-weighted) plus any pending
+// watch-local evidence into the posterior, and return the decision.
+static ProxDecision hmm_fold(int32_t raw_loglr_q8, uint8_t cap_neff) {
+    uint32_t now = prox_platform_now_ms();
+    hmm_advance(now);
+
+    // Watch-local evidence (§6.1) is summed with the anchor's verdict BEFORE the
+    // draw gate, not after. The spec places it outside the N_eff discount, but
+    // hardware showed why that cannot stand: a still watch that repeatedly fails
+    // to connect was adding LL_CONNFAIL_AWAY every single poll, marching the
+    // posterior to saturation on what is one observation repeated. That is the
+    // frozen-fade failure exactly, arriving through a different channel. A
+    // re-failed connect with nothing moved is no more independent than a
+    // re-measured fade, so it earns evidence on the same terms.
+    int32_t total = raw_loglr_q8 + g_hmm_local_q8;
+    g_hmm_local_q8 = 0;
+
+    // A zero total is a no-information observation (a failed query with no
+    // advertisement to judge it by, or a score sitting exactly on the anchor's
+    // cutoff). Don't spend accrued draws on it — the credit belongs to the next
+    // tick that actually says something.
+    if (total != 0) {
+        uint32_t draws = hmm_earn_draws(now - g_hmm_emit_ms);
+        g_hmm_emit_ms = now;
+        g_hmm_first   = 0;
+
+        if (draws) {
+            // Fresh independent draws: full accumulation, and this opens a new
+            // still-window budget anchored on what these draws just said.
+            if (cap_neff && draws > cap_neff) draws = cap_neff;
+            if (draws > 63) draws = 63;
+            int32_t add = (total * (int32_t)PROX_LUT_NEFF_GAIN[draws]) >> 8;
+            g_hmm_lam_q8 += add;
+            g_hmm_still_credited_q8 = add;
+        } else {
+            // No fresh draw — the wrist has not moved. The window's evidence is a
+            // LEVEL worth at most one observation, not a per-tick increment, so
+            // credit only the change since this window's last reading.
+            //
+            // Both halves matter, and hardware demonstrated both: re-reading the
+            // same thing must add nothing (else a still watch that keeps failing
+            // to connect marches to saturation), but a *materially different*
+            // reading must still land (else whichever observation happens to
+            // arrive first in a window silently locks out every later one — a
+            // weak connect-failure hint suppressing the anchor's actual score).
+            int32_t target = (total * (int32_t)PROX_LUT_NEFF_GAIN[1]) >> 8;
+            int32_t delta  = target - g_hmm_still_credited_q8;
+            // Only ever move further in the direction the observation points;
+            // never claw back evidence that stronger draws already established.
+            if ((total > 0 && delta > 0) || (total < 0 && delta < 0)) {
+                g_hmm_lam_q8 += delta;
+                g_hmm_still_credited_q8 = target;
+            }
+        }
+    }
+
+    g_hmm_lam_q8 = clamp_i32(g_hmm_lam_q8, -HMM_LAMBDA_MAX_Q8, HMM_LAMBDA_MAX_Q8);
+    return hmm_decide();
+}
+
+ProxDecision prox_hmm_tick(const ProxScoreResult2* r) {
+    // A tick with no query still folds in whatever watch-local evidence is
+    // pending (a failed connect is itself an observation) and still advances the
+    // transition model.
+    if (!r) return hmm_fold(0, 0);
+    // Centre the anchor's verdict on ITS decision point, not on score 128: a
+    // calibration-v2 anchor has demonstrated where its near zone ends, and that
+    // cutoff is the score at which the evidence is genuinely neutral.
+    uint8_t thr = r->near_thr ? r->near_thr : (uint8_t)PROX_CONFIDENCE_THRESHOLD_U8;
+    int32_t raw = (int32_t)PROX_LUT_LOGIT8[r->score] - (int32_t)PROX_LUT_LOGIT8[thr];
+    return hmm_fold(raw, r->neff);
+}
+
+// Modes B/C entry point: the coloc factors already produce a summed log-LR, so
+// they enter the same filter directly (§6.4 — the old two-threshold hysteresis
+// machine is subsumed by the posterior). They ride the same draw-gating, because
+// a still watch's coloc factors are exactly as frozen as its Mode A score.
+ProxDecision prox_hmm_tick_loglr_q8(int32_t loglr_q8) {
+    return hmm_fold(loglr_q8, 0);
+}
+
+// Pure read: no transition step, no evidence. Callers that want the elapsed-time
+// decay (a poll that produced no query) tick with a NULL result instead. Keeping
+// this side-effect-free matters because the poll-tier logic consults it from the
+// main loop many times a second.
+ProxDecision prox_hmm_decision(void) { return hmm_decide(); }
+
+int32_t prox_hmm_logodds_q8(void) { return g_hmm_lam_q8; }
+
+uint8_t prox_hmm_p_near_u8(void) {
+    // Diagnostics only (shadow logging). p = 1 / (1 + e^-|L|) = e^-corr(|L|),
+    // with corr from the logsumexp table and a 4-term series for the exponential
+    // over its tiny domain [0, ln 2].
+    int32_t lam = g_hmm_lam_q8;
+    int32_t a   = lam < 0 ? -lam : lam;
+    int32_t k   = a >> 5;
+    int32_t u   = (k >= 64) ? 0 : (int32_t)PROX_LUT_LSE_CORR[k];    // Q8, 0..177
+    int32_t u2  = (u * u) >> 8;
+    int32_t u3  = (u2 * u) >> 8;
+    int32_t u4  = (u3 * u) >> 8;
+    int32_t e   = 256 - u + (u2 / 2) - (u3 / 6) + (u4 / 24);        // e^-u, Q8
+    e = clamp_i32(e, 0, 256);
+    int32_t p = (lam >= 0) ? e : (256 - e);
+    return (uint8_t)clamp_i32(p, 0, 255);
+}
+
+#endif // PROXIMITY_ROLE_WATCH
+
+// ============================================================================
 // MODES B / C — CO-LOCATION DETECTOR (watch side)
 // ============================================================================
 #ifdef PROXIMITY_ROLE_WATCH
 
-// ---- ring buffer of floats (temporal integration, Lever 1) ----
-typedef struct { float v[COLOC_WINDOW_SAMPLES]; int idx, cnt; } RingF;
-static void ring_reset(RingF* r) { r->idx = 0; r->cnt = 0; }
-static void ring_push(RingF* r, float x) {
-    r->v[r->idx] = x;
-    r->idx = (r->idx + 1) % COLOC_WINDOW_SAMPLES;
-    if (r->cnt < COLOC_WINDOW_SAMPLES) r->cnt++;
-}
-static int ring_mean(const RingF* r, float* out) {
-    if (r->cnt == 0) return 0;
-    float s = 0; for (int i = 0; i < r->cnt; ++i) s += r->v[i];
-    *out = s / r->cnt; return 1;
-}
-static int ring_var(const RingF* r, float* out) {
-    if (r->cnt < 2) return 0;
-    float m; ring_mean(r, &m);
-    float s = 0; for (int i = 0; i < r->cnt; ++i) { float d = r->v[i] - m; s += d * d; }
-    *out = s / (r->cnt - 1); return 1;
-}
-
 // ---- config + state ----
-static ColocConfig g_cfg;
-static RingF       g_rwp;     // watch<->phone RSSI window  (Factor 1 + Factor V)
-static RingF       g_delta;   // R_P - R_D window           (Factor delta, Mode C)
-static RingF       g_s;       // per-reading std(delta_d)   (Factor 2)
-static ColocState  g_state = COLOC_AWAY;
-static int         g_debounce = 0;
-static ColocDecision g_last = { 0.0f, COLOC_AWAY, 0, 0 };
+// v2.1 §6.4: the flat EWMA rings are replaced by the motion-gated integrator —
+// the coloc factors were exactly as vulnerable to a frozen fade as Mode A was.
+// Var(R_wp) (the "phone held" signature) now comes from the integrator's own
+// variance estimate, which relaxes toward a single draw while the wrist is
+// still, so "low variance" can no longer mean "nothing has moved in an hour".
+static ColocConfig    g_cfg;
+static ProxIntegrator g_rwp;     // watch<->phone RSSI   (Factor 1 + Factor V)
+static ProxIntegrator g_delta;   // R_P - R_D            (Factor delta, Mode C)
+static ProxIntegrator g_s;       // per-reading std(delta_d) (Factor 2)
+static ColocState     g_state = COLOC_AWAY;
+static ColocDecision  g_last = { 0.0f, COLOC_AWAY, 0, 0 };
 
 // per-reading scratch
 static int   g_have_rwp = 0;   static int8_t g_cur_rwp = 0;
@@ -648,8 +1138,11 @@ void coloc_finalize_calibration(void) {
 ColocConfig* coloc_config(void) { return &g_cfg; }
 
 void coloc_init(void) {
-    ring_reset(&g_rwp); ring_reset(&g_delta); ring_reset(&g_s);
-    g_state = COLOC_AWAY; g_debounce = 0;
+    prox_integ_reset(&g_rwp); prox_integ_reset(&g_delta); prox_integ_reset(&g_s);
+    g_state = COLOC_AWAY;
+    // Compliant for a phone-distance commitment is AWAY, so that is the
+    // criterion-satisfying cold start (§6.3).
+    prox_hmm_reset(PROX_CRIT_PHONE_AWAY);
     size_t len = 0;
     if (prox_platform_nvs_load(COLOC_NVS_KEY, &g_cfg, sizeof(g_cfg), &len) && len == sizeof(g_cfg)) {
         // loaded persisted calibration
@@ -673,39 +1166,46 @@ void coloc_ingest_shared_device(int8_t watch_rssi, int8_t peer_rssi) {
 }
 
 void coloc_mark_reading_end(void) {
-    if (g_have_rwp) ring_push(&g_rwp, (float)g_cur_rwp);
-    if (g_have_diff) ring_push(&g_delta, (float)g_cur_rp - (float)g_cur_rd);
+    if (g_have_rwp)  prox_integ_update(&g_rwp,   (int32_t)g_cur_rwp << 8);
+    if (g_have_diff) prox_integ_update(&g_delta, ((int32_t)g_cur_rp - (int32_t)g_cur_rd) << 8);
     if (g_dcount >= (uint32_t)COLOC_ENV_MIN_SHARED_DEVICES) {
         double mean = g_dsum / g_dcount;
         double var  = g_dsumsq / g_dcount - mean * mean;
         if (var < 0) var = 0;
-        ring_push(&g_s, (float)sqrt(var));
+        prox_integ_update(&g_s, (int32_t)(sqrt(var) * 256.0));
     }
     g_have_rwp = 0; g_have_diff = 0;
     g_dsum = g_dsumsq = 0; g_dcount = 0;
 }
 
-// ---- fusion + hysteresis ----
+// ---- fusion + HMM decision layer ----
 ColocDecision coloc_tick(void) {
     ColocDecision out = { 0.0f, g_state, 0, 0 };
 
-    float log_odds = logf(g_cfg.prior_near / (1.0f - g_cfg.prior_near));
+    // The prior is no longer added per tick: it lives in the HMM's cold start
+    // (prox_hmm_reset), and re-adding it every tick would double-count it.
+    float log_lr = 0.0f;
+    int32_t m = 0;
 
     float rwp_mean = 0.0f;
-    int have_rwp = ring_mean(&g_rwp, &rwp_mean);
-    if (have_rwp) { log_odds += feature_loglr(&g_cfg.rwp, rwp_mean); out.used_factors |= COLOC_F_RANGE; }
-
-    float dmean;
-    if (ring_mean(&g_delta, &dmean)) { log_odds += feature_loglr(&g_cfg.delta, dmean); out.used_factors |= COLOC_F_DIFF; }
-
-    float smean;
-    if (ring_mean(&g_s, &smean)) { log_odds += feature_loglr(&g_cfg.s, smean); out.used_factors |= COLOC_F_ENV; }
+    int have_rwp = prox_integ_mean_q8(&g_rwp, &m);
+    if (have_rwp) {
+        rwp_mean = (float)m / 256.0f;
+        log_lr += feature_loglr(&g_cfg.rwp, rwp_mean); out.used_factors |= COLOC_F_RANGE;
+    }
+    if (prox_integ_mean_q8(&g_delta, &m)) {
+        log_lr += feature_loglr(&g_cfg.delta, (float)m / 256.0f); out.used_factors |= COLOC_F_DIFF;
+    }
+    if (prox_integ_mean_q8(&g_s, &m)) {
+        log_lr += feature_loglr(&g_cfg.s, (float)m / 256.0f); out.used_factors |= COLOC_F_ENV;
+    }
 
     float rwp_var = 0.0f;
-    int   have_var = ring_var(&g_rwp, &rwp_var);
-    if (have_var) { log_odds += feature_loglr(&g_cfg.var, rwp_var); out.used_factors |= COLOC_F_VAR; }
-
-    out.p_near = logistic(log_odds);
+    int   have_var = prox_integ_var_q8(&g_rwp, &m);
+    if (have_var) {
+        rwp_var = (float)m / 256.0f;
+        log_lr += feature_loglr(&g_cfg.var, rwp_var); out.used_factors |= COLOC_F_VAR;
+    }
 
     // "holding" signature: high mean RSSI + low variance.
     if (have_rwp && have_var) {
@@ -714,19 +1214,18 @@ ColocDecision coloc_tick(void) {
         out.holding = (rwp_mean >= rwp_mid && rwp_var <= var_mid) ? 1u : 0u;
     }
 
-    // Two-threshold hysteresis with debounce. Ambiguous band holds current state;
-    // fail-safe bias toward AWAY/compliant is realised by TAU_HIGH > TAU_LOW and
-    // requiring sustained high evidence to flip to NEAR (spec §4.8).
-    ColocState cand = g_state;
-    if (out.p_near >= COLOC_TAU_HIGH)      cand = COLOC_NEAR;
-    else if (out.p_near <= COLOC_TAU_LOW)  cand = COLOC_AWAY;
+    // The two-threshold hysteresis machine and its debounce counter are deleted:
+    // the posterior subsumes both (§6.4). Flip resistance now comes from the
+    // motion-conditioned transition model, which is stronger than a debounce
+    // count because it is indexed on whether the wrist *could* have moved.
+    // AMBIGUOUS holds the current state — and the state starts (and re-cold-starts)
+    // at AWAY, so the fail-safe bias toward the compliant side is preserved.
+    ProxDecision d = prox_hmm_tick_loglr_q8((int32_t)(log_lr * 256.0f));
+    if      (d == PROX_HMM_NEAR) g_state = COLOC_NEAR;
+    else if (d == PROX_HMM_AWAY) g_state = COLOC_AWAY;
 
-    if (cand != g_state) {
-        if (++g_debounce >= COLOC_DEBOUNCE_SAMPLES) { g_state = cand; g_debounce = 0; }
-    } else {
-        g_debounce = 0;
-    }
-    out.state = g_state;
+    out.p_near = (float)prox_hmm_p_near_u8() / 255.0f;
+    out.state  = g_state;
 
     g_last = out;
     return out;
