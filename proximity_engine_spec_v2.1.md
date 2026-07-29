@@ -25,6 +25,7 @@ v2.0 defined the right physics but was written against an idealized platform. v2
 | Wi-Fi CSI | **Kept via link reversal, Phase 4.** Watch-side CSI capture is dead on the frozen toolchain: CSI is a compile-time IDF option (`CONFIG_ESP_WIFI_CSI_ENABLED`, default off) absent from Arduino 2.0.17's precompiled WiFi libs, and RX-side load lands in the known-fragile 4.4.7 coexistence regime. Instead the **watch transmits** an ESP-NOW ping burst (stock TX works on 2.0.17) and the **anchor captures CSI** and folds channel-shape features into the score it already returns — riding the anchor's already-planned pioarduino/IDF 5.x migration. §3.5; Spike S4. |
 | Wi-Fi FTM tie-breaker | **Deferred to Phase 4**, feasibility-gated: the anchor must run APSTA (SoftAP FTM responder + STA + BLE) on 4.4.7. Spike S5. |
 | Fusion: watch sums many log-LRs | **Split.** The **anchor** folds trailer features (PDR, $s_{ch}$, per-channel RSSI) into its returned score using its location-trained distributions — it owns per-location statistics. The **watch** converts that score to a log-LR, adds watch-local evidence (connect-failure, later FTM), and runs the HMM — it owns temporal/motion state. One new wire field pair (`neff` out, trailer in), not ten (§6). |
+| *(not in v2.0)* | **Added in v2.1a: occlusion & tamper resistance (§13, Phase 5).** v2.0 and v2.1 both assume the RF environment is *indifferent*, not *adversarial*. Where a criterion rewards the user for appearing far (sunrise lock's `getAway`), deliberate body/bedding attenuation is a cheap and effective AWAY spoof, and three paths in the shipped design convert it into a confident AWAY. §13 specifies the common-mode/differential discriminant that separates attenuation from displacement, and the abstention rules that make the spoof unprofitable. |
 
 ---
 
@@ -308,6 +309,28 @@ void prox_platform_espnow_ping(uint8_t wifi_channel, uint8_t n_frames);    // wa
 void prox_ingest_csi(const int8_t* csi, uint16_t len,
                      const uint8_t src_mac[6]);                            // anchor CSI callback (§3.5)
 void prox_ingest_ftm(uint16_t dist_cm, uint16_t sigma_cm, bool ok);        // watch, tie-breaker
+
+// ── Phase 5 — occlusion & tamper resistance (§13; provisional until S6) ──
+typedef struct {
+    int8_t   delta_db;      // common-mode offset vs reference; 0x80 = unknown
+    uint8_t  mad_db;        // differential dispersion (MAD of residuals); 0xFF = unknown
+    uint8_t  censor_u8;     // rank-monotonicity of dropouts, 255=perfect; 0xFF = unknown
+    uint8_t  chflat_db;     // per-channel spread of the offset; 0xFF = unknown
+    uint8_t  shared;        // |S|, devices shared with the reference vector
+    uint8_t  dropped;       // |D|, reference devices now absent
+} ProxOcclusion;
+
+// (watch) Recompute the occlusion statistics for the vector about to be sent
+// and update the reference. Called once per observation window, before the
+// vector is written. Returns the Q8 log-LR of occlusion-vs-displacement.
+int16_t  prox_occlusion_eval(const ProxScanVector2* v, ProxOcclusion* out);
+int      prox_is_occluded(void);          // ℓ_occ ≥ OCC_LOGLR_TAU_Q8, latched per §13.5
+uint32_t prox_occlusion_sustained_ms(void); // for the §13.6 reportable event
+
+// (anchor) Common-mode offset of a vector against the trained fingerprint,
+// in dB; ±0x7F when undeterminable. Used to make Signal B affine-invariant
+// (§13.4-R2) and exposed so the level term can be gated separately.
+int8_t   prox_fingerprint_offset_db(const ProxScanVector2* v);
 ```
 
 Wire formats for `ProxScanVector2`, the 3-byte score payload, the Minor encoding, and the calibration leg byte are normative in the FIRMWARE_SPEC v0.9 amendment §6.3 / §5.6.
@@ -360,6 +383,21 @@ ENFORCEMENT_POLL_INTERVAL_STILL_S = 600
 CPL_WINDOW_S                      = 12
 CPL_BIN_MS                        = 250
 CPL_MIN_MOTION_BINS               = 8
+
+// Occlusion & tamper resistance (Phase 5 — provisional; S6 sets the real numbers)
+OCC_ENABLE                        = 1       // 0 ⇒ byte-identical to P4
+OCC_REF_MAX_AGE_S                 = 900     // reference vector expiry
+OCC_MIN_SHARED                    = 6       // |S| below this ⇒ δ/MAD abstain
+OCC_MIN_DROPOUTS                  = 3       // |D| below this ⇒ censoring term abstains
+OCC_DELTA_DB                      = -10     // common-mode drop that makes occlusion plausible
+OCC_MAD_DB                        = 4       // residual dispersion below this ⇒ homogeneous
+OCC_CENSOR_MIN_U8                 = 204     // 0.80 rank-monotonicity
+OCC_CHFLAT_DB                     = 5       // per-channel offset spread below this ⇒ absorptive
+OCC_LOGLR_TAU_Q8                  = 512     // +2.0 nats ⇒ declare OCCLUDED
+OCC_CLEAR_TAU_Q8                  = 128     // +0.5 nats ⇒ clear the latch (hysteresis)
+OCC_SUSTAIN_S                     = 120     // OCCLUDED this long ⇒ reportable event (§13.6)
+LL_LEVEL_MAX_Q8                   = 384     // cap on the separated absolute-level term (§13.4-R2)
+PROX_STARVED_SCORE                = 128     // criterion-neutral; replaces the score-50 branch
 ```
 
 ---
@@ -373,5 +411,155 @@ CPL_MIN_MOTION_BINS               = 8
 | **P2** | Beacon schedule + Minor tagging, vector v2 + trailer, score2 + neff, PDR + $s_{ch}$ + per-channel side table, motion-qualified & away training, calibration leg byte | Lockstep batch | S1, S2 |
 | **P3** | Mode C per-channel $\delta$, coupling detector, TX_LO miscal flag | none beyond P2 | P2 shipped |
 | **P4** | Reversed-link CSI (§3.5); FTM tie-breaker | `…000E` + channel byte (CSI); FTM TBD | S4, S5; anchor IDF 5.x migration for CSI |
+| **P5** | **Occlusion & tamper resistance (§13):** common-mode/differential discriminant, offset-invariant Signal B, abstention hardening, sustained-occlusion event | Lockstep batch (trailer + score flag) | S6; P2 shipped |
 
-Spikes: **S1** TX_LO level table + channel-map availability on this NimBLE (fallback §3.4). **S2** per-slot adv reconfig stability while connectable (fallback slower slots). **S3** LIS3DH burst thresholds on real wrists (STILL/FIDGET/LOCO confusion matrix). **S4** reversed-link CSI: sdkconfig `CONFIG_ESP_WIFI_CSI_ENABLED` check first, then anchor-side capture + BLE + STA stability on IDF 5.x, plus watch ESP-NOW TX beside NimBLE on 4.4.7 (§3.5). **S5** anchor APSTA + FTM responder under 4.4.7 coexistence.
+Spikes: **S1** TX_LO level table + channel-map availability on this NimBLE (fallback §3.4). **S2** per-slot adv reconfig stability while connectable (fallback slower slots). **S3** LIS3DH burst thresholds on real wrists (STILL/FIDGET/LOCO confusion matrix). **S4** reversed-link CSI: sdkconfig `CONFIG_ESP_WIFI_CSI_ENABLED` check first, then anchor-side capture + BLE + STA stability on IDF 5.x, plus watch ESP-NOW TX beside NimBLE on 4.4.7 (§3.5). **S5** anchor APSTA + FTM responder under 4.4.7 coexistence. **S6** occlusion statistics on real bedding and real bodies (§13.7) — the only spike that gathers *distributions* rather than answering a yes/no feasibility question.
+
+---
+
+## 13. Occlusion & Tamper Resistance (Phase 5)
+
+### 13.0 Why this section exists
+
+Every model in §1–§12 assumes the RF environment is *indifferent*: noisy, multipath-ridden, sometimes cruel, but not steered by someone with an interest in the answer. That assumption is false for any criterion that **rewards the user for appearing far from an anchor** — `getAway`, and specifically sunrise lock, where the user must leave the bed anchor to dismiss the alarm and would very much like not to.
+
+The attack is not exotic. A watch worn on a wrist tucked under a sleeping body, face-down in a mattress, is attenuated by 15–25 dB. That is indistinguishable from a 6–17× increase in free-space distance *by amplitude alone*, costs nothing, requires no equipment, and can happen by accident. A design that cannot separate it from displacement will be defeated in the first week of real use, and — worse — will be defeated *unintentionally*, generating false AWAY for compliant sleeping users.
+
+**The governing asymmetry, normative:** a passive attenuating adversary can fabricate **AWAY but not NEAR**. Attenuation only ever removes signal. Producing a false NEAR requires active gain (a repeater or relay), which is out of scope for this phase and would be attacked differently (§13.8). Every abstention, fallback, and unknown path introduced anywhere in this engine must therefore be biased so that concluding **far requires more evidence than concluding near**. Phase 5 is largely the systematic application of that one rule.
+
+### 13.1 What soft material actually does at 2.4 GHz
+
+λ ≈ 12.5 cm, so thin low-water-content fabrics are nearly transparent; the loss budget is dominated by water and by near-field antenna detuning, not by the number of layers.
+
+| Obstruction | Typical one-way loss @ 2.44 GHz |
+|---|---|
+| Cotton sheet, per layer | < 0.5 dB |
+| Duvet / pillow (predominantly air) | 1–3 dB |
+| Memory-foam mattress, ~15 cm | 3–10 dB |
+| **Human torso (~70 % water, ~25 cm)** | **15–30 dB** |
+| Near-field detune (chip antenna pressed into a dense dielectric) | 6–15 dB, additive |
+
+**Consequence 1 — bedding alone is not the threat.** Sheets and pillows total perhaps 3–5 dB, inside the normal small-scale fading swing of §1.2 and already absorbed by the integrator. The threat is the *body*, or the antenna pressed against dense material. This matters for setting thresholds: `OCC_DELTA_DB` must sit above the bedding-only regime or the detector fires on every sleeping user.
+
+**Consequence 2 — and this is the whole discriminant — the loss is at the watch antenna, so it is *common-mode*.** It applies to every path the watch has, to every emitter it hears, by nearly the same amount. Displacement is *differential*: moving to another room changes each device's path geometry by a different amount, and severs some paths entirely while leaving others intact.
+
+| | Deliberate/accidental occlusion | Genuine displacement |
+|---|---|---|
+| Per-device ΔRSSI | tightly clustered around one offset | broadly dispersed |
+| Which devices drop out | the weakest ones, in rank order | whichever ones a wall now blocks |
+| Cross-channel behaviour | flat (absorption is broadband) | frequency-selective (§1.2) |
+| IMU | no locomotion required | locomotion necessarily present |
+| Reversibility | instant on uncovering | requires walking back |
+
+The right question is therefore never "is the signal weak?" — it is **"is the *shape* of the environment preserved?"** Shape is what displacement destroys and attenuation leaves alone.
+
+### 13.2 What the shipped design already gets right
+
+`signal_correlation()` (Signal A) is Pearson, which is **invariant under any affine transform of either vector**. A uniform −20 dB blanket leaves ρ mathematically unchanged. This is not luck — correlating *patterns* rather than comparing *levels* is exactly the correct response to a common-mode attacker, and it means the Mode A Signal-A path needs no defending.
+
+The motion-conditioned transition prior (§6.2) is the second existing defence and the strongest: at `HMM_PFLIP_STILL`, a wrist that is provably still essentially cannot transition NEAR→AWAY, no matter what the amplitude does. You cannot get an order of magnitude farther from an anchor without walking.
+
+Phase 5 exists because **evidence can still reach the posterior through paths that bypass both of these**, and because one Phase-2 feature actively reintroduces the vulnerability.
+
+### 13.3 The three leaks (all present in the shipped code)
+
+**L1 — the starved-vector fallback is a hard AWAY.** `prox_compute_score()` short-circuits below `PROX_MIN_DEVICE_COUNT` (8) to a raw-RSSI comparison returning score 200 or **50**. Attenuation censors the weakest emitters first, so a 15 dB blanket takes a typical 12–29-device vector under the floor; the entire correlation architecture is then bypassed in favour of the one statistic the attack directly defeats. **The attack does not have to beat Signal A — it only has to starve it.** This is the primary exploit.
+
+**L2 — connect-failure evidence has no motion witness.** `prox_note_connect_failure()` contributes `LL_CONNFAIL_AWAY_Q8` (−3 nats) whenever the advertisement is receivable at ≤ `PROX_FAR_RSSI_THRESHOLD_DBM` but the link will not close — precisely what occlusion produces at 30 cm. The P1 still-window budget caps the damage at one draw's worth, so this is bounded rather than open, but it is not zero and it is pure attacker-controlled input.
+
+**L3 — Signal B is not offset-invariant, and P2 makes it dominant.** `signal_fingerprint()` evaluates a Gaussian Naive-Bayes likelihood on **absolute** dBm (`dx = x − μ`), and imputes censored devices at `PROX_MISSING_RSSI_DBM` (−100) rather than at their attenuated expectation. A uniform −20 dB shift moves every residual by 20 dB and collapses `L`. Because `alpha = exp(−W_total/PROX_ALPHA_W0)`, a *well-trained* anchor drives α→0 and the score becomes almost purely `L` — **weighting out the one branch that was immune.** Training fingerprints improves accuracy and simultaneously opens this hole; the two must land together.
+
+### 13.4 Countermeasures
+
+Numbered R1–R5, in dependency order. R1 and R4 are pure hardening with no wire cost and no new statistics; R2, R3 and R5 need the P5 batch.
+
+**R1 — truncation is not distance (fixes L1).** Delete the score-50 branch. Below `PROX_MIN_DEVICE_COUNT` the anchor returns `score = PROX_STARVED_SCORE` (128, criterion-neutral, lands inside the HMM dead zone), `neff = 0`, and `PROX_FLAG_LOW_DEVICE_COUNT`. The watch's emission is then structurally zero — a starved vector says *nothing*, which is the truth.
+
+The score-200 branch (own-anchor raw RSSI ≥ `ANCHOR_NEAR_RSSI_THRESHOLD_DBM`) is **retained**, deliberately asymmetric: a strong own-anchor RSSI cannot be manufactured by an attenuating adversary, so near-evidence from a starved vector remains trustworthy while far-evidence does not. This is §13.0's rule in its simplest form.
+
+**R2 — offset-invariant Signal B, with the level information split out (fixes L3).** Two changes to `signal_fingerprint()`:
+
+1. Estimate the common-mode offset against the fingerprint over **present** devices only:
+   $$\hat{\delta} = \operatorname*{median}_{i \in \text{fp-active} \,\cap\, V}\left(x_i - \mu_i\right)$$
+   Evaluate the shape term at $x_i - \hat{\delta}$, and impute censored fingerprint devices at $\mu_i + \hat{\delta}$ (their attenuated expectation) instead of −100. The shape term is now affine-invariant like Signal A. This is a strict improvement irrespective of anyone cheating — it also fixes the mundane cases: a coat sleeve, a duvet, a watch worn under a cuff.
+2. The absolute level is genuinely informative about distance and must not simply be discarded. Re-admit it as its own explicit, capped, separately-gated term $\ell_{\text{level}} = \text{clamp}(f(\hat\delta), \pm\texttt{LL\_LEVEL\_MAX\_Q8})$, which **abstains to 0 whenever the occlusion classifier fires**. Split the signal; gate only the half that is attackable.
+
+**R3 — the occlusion classifier (watch side).** The watch retains a **reference vector** $V_{\text{ref}}$: the most recent vector captured while the HMM was confident *and* motion permitted a position update, expiring after `OCC_REF_MAX_AGE_S`. Against it, per observation window, with $S$ = shared devices, $D$ = reference devices now absent, $R$ = survivors:
+
+| Statistic | Definition | Integer method |
+|---|---|---|
+| $\delta$ (common-mode) | $\operatorname{median}_{i\in S}\left(r_i(t) - r_i(\text{ref})\right)$ | 121-bin histogram over −60…+60 dB, median by prefix count — $O(|S|)$, no sort |
+| $\text{MAD}$ (differential) | $\operatorname{median}_{i\in S}\left|\Delta_i - \delta\right|$ | second pass over the same histogram |
+| $C$ (censor monotonicity) | $\dfrac{\#\{(d,r) \in D\times R : r_d(\text{ref}) < r_r(\text{ref})\}}{|D|\cdot|R|}$ | bucket $R$ by int8 RSSI into 128 bins, prefix-sum, one pass over $D$ — $O(|S| + 128)$ |
+| $F$ (channel flatness) | $\max_c \Delta_c - \min_c \Delta_c$ over channels 37/38/39 for the target anchor | requires S1b channel control; abstains under the §3.4 fallback |
+| motion witness | LOCOMOTION observed since $V_{\text{ref}}$? | already tracked (§4.1) |
+
+$C$ is a normalized Mann–Whitney statistic: $C = 1$ means every dropout was weaker than every survivor (perfect monotone censoring, the absorptive signature); $C \approx 0.5$ means dropouts were unrelated to previous strength (the displacement signature). It abstains when $|D| < \texttt{OCC\_MIN\_DROPOUTS}$ or $|R| < \texttt{OCC\_MIN\_DROPOUTS}$; $\delta$ and MAD abstain when $|S| < \texttt{OCC\_MIN\_SHARED}$.
+
+These combine in log-odds domain exactly as §5.2's features do — **not** as a hard AND — each term abstaining to 0 when undefined:
+
+$$\ell_{\text{occ}} = \ell_\delta + \ell_{\text{MAD}} + \ell_C + \ell_F + \ell_{\text{motion}}$$
+
+with Gaussian/Beta near-away distributions trained per §5.3 from S6 data and defaulted from the `OCC_*` constants until then. OCCLUDED is latched when $\ell_{\text{occ}} \ge \texttt{OCC\_LOGLR\_TAU\_Q8}$ and cleared below `OCC_CLEAR_TAU_Q8` (hysteresis, so a marginal case does not chatter). $\ell_{\text{motion}}$ carries the most weight by design: a large common-mode drop with *no locomotion since the reference* has no physical displacement explanation at all.
+
+**R4 — connect-failure requires a motion witness (fixes L2).** `prox_note_connect_failure()` contributes `LL_CONNFAIL_AWAY_Q8` **only if LOCOMOTION has been observed since the last successful connect to that anchor**; otherwise exactly 0. The justification is physical rather than statistical: with no locomotion, the distance cannot have changed, so a failed connect is a statement about the channel, not about geometry. Zero, not down-weighted.
+
+**R5 — what OCCLUDED does to the posterior: suppress, never invert.** When OCCLUDED is latched:
+
+- the anchor score's emission is forced to `neff = 0` (contributes nothing);
+- $\ell_{\text{level}}$ (R2) abstains;
+- the connect-failure term is suppressed regardless of R4;
+- the **transition prior still runs**, so the posterior decays toward the prior over hours, but no *observation* moves it.
+
+Absence of signal is absence of evidence. Note that this deliberately does **not** push toward NEAR either — inverting the evidence would create the mirror exploit (deliberately occluding to force a false NEAR), and §13.0's asymmetry is about which conclusion needs *more* evidence, not about manufacturing one.
+
+### 13.5 Reference-vector lifecycle (the part that goes wrong if rushed)
+
+$V_{\text{ref}}$ is the entire basis of R3, so its maintenance is normative:
+
+- **Set** on any observation window where the HMM is confident (NEAR or AWAY, not AMBIGUOUS) *and* `neff ≥ NEFF_TRAIN_MIN`.
+- **Re-set** — not merely refreshed — after any sustained LOCOMOTION segment, because the user is legitimately somewhere else and every statistic in R3 is relative.
+- **Expire** at `OCC_REF_MAX_AGE_S`; with no valid reference, $\ell_{\text{occ}} = 0$ and the engine reverts to P4 behaviour. Fail toward the previous phase, never toward a decision.
+- **Discard** on ENFORCEMENT entry (the engine cold-starts per §2).
+
+The failure mode to test for: a user who legitimately moves to another room, and whose stale bedroom reference then makes every subsequent window read as "occluded". The re-set-on-locomotion rule is what prevents it, and the S6 replay corpus must contain this case.
+
+### 13.6 Detection is not prevention — the product question this spec will not answer silently
+
+The engine can refuse to be **fooled**. It cannot refuse to be **jammed**: a user who stays buried simply produces no usable evidence, and R5 correctly freezes the posterior. For `stayNear` that is the right and safe outcome. For `getAway` — sunrise lock — it is a denial of service on the enforcement: the alarm never satisfies, but neither does it correctly refuse to satisfy.
+
+Phase 5 therefore surfaces the condition rather than resolving it:
+
+- `PROX_FLAG_OCCLUDED` in the score characteristic's flags byte;
+- after `OCC_SUSTAIN_S` continuously occluded during an enforcement window, the watch raises an `occlusionSustained` event to the app.
+
+**Recommendation, requiring an explicit product decision before P5 ships:** for criteria where the user *benefits* from appearing far (`getAway`, sunrise lock), sustained occlusion should be treated as **non-compliant** — the criterion is not satisfied, and the app says why. For `stayNear`, where occlusion offers the user nothing, the frozen posterior of R5 is sufficient and no user-visible action is warranted. This asymmetry is a policy choice with UX consequences (a sleeping user who rolls onto their watch is not cheating), and it must be made by a person, not inherited from a default.
+
+### 13.7 Spike S6 — the missing distributions
+
+Every threshold in §11's `OCC_*` block is currently an estimate from first principles. S6 gathers the real distributions. Unlike S1–S5 it answers no feasibility question; it is a measurement campaign, and it is the gate for P5.
+
+Capture the full vector plus per-channel RSSI and motion state at ~1 Hz for ≥ 3 minutes per condition, on ≥ 2 wrists in ≥ 2 homes:
+
+| # | Condition | Expected signature |
+|---|---|---|
+| a | Watch under a duvet, arm free | small \|δ\| (~2–4 dB), tiny MAD — **must not** trip the detector |
+| b | Watch under a pillow | \|δ\| ~3–6 dB, tiny MAD — must not trip |
+| c | Arm tucked under torso, face-down in mattress | \|δ\| ≥ 12 dB, small MAD, high $C$, no locomotion — **must** trip |
+| d | Watch removed and buried in bedding | same RF signature as (c); separable only by IMU (§13.8) |
+| e | Genuine walk to the next room | large \|δ\| **and** large MAD, $C \approx 0.5$, locomotion present — must **not** trip |
+| f | Genuine walk within the same room | moderate δ, large MAD — must not trip |
+| g | Rolling over in bed (accidental, repeated) | δ oscillating; tests latch hysteresis |
+
+**Pass criterion:** thresholds exist that give ≥ 90 % detection on (c) and ≤ 5 % false-positive across (a), (b), (e), (f). **If no such separation exists**, fall back to R1/R2/R4 alone — which close the exploits without ever needing to classify — and ship R3/R5 disabled (`OCC_ENABLE = 0`). R1/R2/R4 are the load-bearing part of this phase; R3/R5 are the sharpening.
+
+### 13.8 Open questions (do not guess these — they need S6 data)
+
+- **Occlusion vs. watch-removal.** Conditions (c) and (d) are RF-identical. The only separator is the IMU: a worn watch is never perfectly still — respiration and pulse produce micro-motion measurable at the LIS3DH's noise floor at high ODR, and a watch on a nightstand does not. Whether that separation survives at `IMU_BURST_HZ = 50` with the existing HP filter is unknown, and off-wrist detection is arguably its own feature rather than part of this phase. S6 should log raw burst variance in both conditions so the question can be settled with data.
+- **Channel flatness under the S1b fallback.** $\ell_F$ is the cleanest physical discriminant in R3 (absorption is broadband; fading is frequency-selective) and it is unavailable while `BEACON_CHANNEL_CONTROL = 0`. This is an independent reason to revisit S1b via the `NimBLEExtAdvertisement::setPrimaryChannels()` route noted in `tests/prox_v2_spikes.md`.
+- **Active relay attacks** (a repeater manufacturing false NEAR) are out of scope. They require equipment, they are the opposite polarity to everything here, and the countermeasure is different in kind — round-trip timing (FTM, §3.5/P4) rather than amplitude statistics.
+- **Interaction with the P3 coupling detector.** A phone and watch both buried together will show correlated occlusion; whether $\rho_{\text{cpl}}$ degrades gracefully under R5's evidence suppression is untested.
+
+### 13.9 Pull-forward subset
+
+The user-facing schedule places P5 after P4. **L1 and L2 are exploitable in the shipped firmware today**, and their fixes — **R1 and R4** — are watch/anchor-local, need no wire change, no new statistics, and no S6 data. If sunrise lock ships before P5, pull R1 and R4 forward into whichever phase is current; they are individually small and independently testable. R2 must land no later than the first fleet-wide fingerprint training, since that is the point at which L3 becomes the dominant path.
