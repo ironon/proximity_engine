@@ -56,7 +56,14 @@
 #define IMU_STILL_VAR                        400      // (20 mg RMS)^2
 #define IMU_LOCO_VAR                         15000    // (~122 mg RMS)^2, S3-measured gap
 #define IMU_LOCO_MIN_INTS                    2
-#define IMU_STALE_MS                         5000
+// Raised from 5000 after field measurement: when the anchor is marginal the GATT
+// connect blocks for its full 5 s timeout, so the gap from the burst (taken
+// during the pre-query scan) to the tick reaches ~5.7 s and the motion channel
+// went UNKNOWN exactly when queries were slowest. UNKNOWN fails toward
+// LOCOMOTION, so this was safe rather than dangerous, but it blinded the channel
+// precisely when the link was struggling. 10 s still detects a genuinely dead
+// seam promptly.
+#define IMU_STALE_MS                         10000
 // Step-cadence detection inside one burst. RETIRED AS A CLASSIFIER INPUT: the
 // same S3 pass showed it flipping on noise at typing amplitudes — bursts of
 // var 9278 and 9788, physically indistinguishable, were separated only by this
