@@ -284,7 +284,14 @@ static void test_walk_approach(void) {
         feed_loco();
         double truth = -85.0 + 35.0 * (i / 12.0);
         if (truth > -50.0) truth = -50.0;
-        if (cross_tick < 0 && score_from_rssi(truth) >= PROX_CONFIDENCE_THRESHOLD_U8) cross_tick = i;
+        // Count from where the engine can first SEE the crossing, not from the
+        // bare threshold: HMM_EMIT_DEADZONE_U8 deliberately discards scores
+        // within 20 counts of the cutoff, because hardware showed noise there
+        // accumulating into false certainty. A detector cannot be asked to react
+        // to a signal it is designed to ignore.
+        if (cross_tick < 0 &&
+            score_from_rssi(truth) >= PROX_CONFIDENCE_THRESHOLD_U8 + HMM_EMIT_DEADZONE_U8)
+            cross_tick = i;
         ProxScoreResult2 r = mk(score_from_rssi(truth + frand_gauss(5.0)));
         ProxDecision d = prox_hmm_tick(&r);
         if (d == PROX_HMM_NEAR && ticks_after_cross < 0 && cross_tick >= 0)
@@ -652,6 +659,82 @@ static void test_ambiguous_band_abstains(void) {
           (int)prox_hmm_logodds_q8());
 }
 
+
+static void test_field_traces(void) {
+    // Both sequences are the anchor scores actually observed on 2026-07-28,
+    // replayed at the 5 s bench cadence with the motion states that were logged.
+
+    begin("FIELD: walking away from the anchor must leave NEAR");
+    // Log 1. The filter had climbed to NEAR on 198/180/199, then the user walked
+    // away. Scores 157 and 103 were being discarded as "in band" and 79 was
+    // worth -0.1 nats, so v2 stayed convinced of NEAR for the entire walk while
+    // v0.8 had already said AWAY.
+    prox_hmm_reset(PROX_CRIT_STAY_NEAR);
+    const uint8_t near_leg[] = { 237, 233, 235, 198, 199 };
+    for (size_t i = 0; i < sizeof(near_leg)/sizeof(near_leg[0]); ++i) {
+        advance_ms(5000); feed_loco();
+        ProxScoreResult2 r = mk(near_leg[i]); prox_hmm_tick(&r);
+    }
+    CHECK(prox_hmm_decision() == PROX_HMM_NEAR, "setup: should be NEAR (lam=%d)",
+          (int)prox_hmm_logodds_q8());
+
+    const uint8_t away_leg[] = { 79, 157, 103, 103, 79 };
+    int left_near = -1;
+    for (size_t i = 0; i < sizeof(away_leg)/sizeof(away_leg[0]); ++i) {
+        advance_ms(5000); feed_loco();
+        ProxScoreResult2 r = mk(away_leg[i]); prox_hmm_tick(&r);
+        if (left_near < 0 && prox_hmm_decision() != PROX_HMM_NEAR) left_near = (int)i;
+    }
+    CHECK(left_near >= 0 && left_near <= 2, "left NEAR after %d ticks of walking away (lam=%d)",
+          left_near, (int)prox_hmm_logodds_q8());
+    CHECK(prox_hmm_decision() == PROX_HMM_AWAY, "should end AWAY, got %d (lam=%d)",
+          (int)prox_hmm_decision(), (int)prox_hmm_logodds_q8());
+
+    begin("FIELD: walking toward the anchor must reach NEAR promptly");
+    // Log 2, from a cold start across the room: one genuinely-far score of 0,
+    // then the approach. Recovery took ~6 ticks because logit() let that single
+    // score claim -6.2 nats.
+    prox_hmm_reset(PROX_CRIT_STAY_NEAR);
+    const uint8_t approach[] = { 0, 147, 203, 219, 237, 233, 205, 235 };
+    int reached = -1;
+    for (size_t i = 0; i < sizeof(approach)/sizeof(approach[0]); ++i) {
+        advance_ms(5000); feed_loco();
+        ProxScoreResult2 r = mk(approach[i]); prox_hmm_tick(&r);
+        if (reached < 0 && prox_hmm_decision() == PROX_HMM_NEAR) reached = (int)i;
+    }
+    CHECK(reached >= 0, "never reached NEAR on approach (lam=%d)", (int)prox_hmm_logodds_q8());
+    // The approach genuinely starts at score 147, so count from there.
+    CHECK(reached >= 0 && reached <= 5, "reached NEAR at tick %d of the approach", reached);
+
+    begin("FIELD: one extreme score cannot claim more than the cap");
+    prox_hmm_reset(PROX_CRIT_STAY_NEAR);
+    int32_t before = prox_hmm_logodds_q8();
+    advance_ms(5000); feed_loco();
+    ProxScoreResult2 z = mk(0); prox_hmm_tick(&z);
+    // Allow a little slack for the transition step, which also moves lam.
+    CHECK(before - prox_hmm_logodds_q8() <= HMM_EMIT_MAX_Q8 + 64,
+          "a single score of 0 moved the posterior by %d, cap is %d",
+          (int)(before - prox_hmm_logodds_q8()), HMM_EMIT_MAX_Q8);
+
+    begin("FIELD: emission is symmetric about the cutoff");
+    // Equal deviations either side must carry equal weight; the logit form gave
+    // +1.2 nats for 237 and -0.1 for 79.
+    prox_hmm_reset(PROX_CRIT_STAY_NEAR);
+    advance_ms(5000); feed_loco();
+    int32_t base = prox_hmm_logodds_q8();
+    ProxScoreResult2 up = mk(170 + 60); prox_hmm_tick(&up);
+    int32_t gain_up = prox_hmm_logodds_q8() - base;
+
+    prox_hmm_reset(PROX_CRIT_STAY_NEAR);
+    advance_ms(5000); feed_loco();
+    base = prox_hmm_logodds_q8();
+    ProxScoreResult2 dn = mk(170 - 60); prox_hmm_tick(&dn);
+    int32_t gain_dn = base - prox_hmm_logodds_q8();
+    // Within the transition step's own contribution, which is sign-dependent.
+    int32_t skew = gain_up > gain_dn ? gain_up - gain_dn : gain_dn - gain_up;
+    CHECK(skew <= 16, "asymmetric: +60 gave %d, -60 gave %d", (int)gain_up, (int)gain_dn);
+}
+
 // ---------------------------------------------------------------- P2: beacon schedule
 
 static void test_beacon_minor(void) {
@@ -721,6 +804,7 @@ int main(void) {
     test_coloc();
     test_s3_measured_classes();
     test_ambiguous_band_abstains();
+    test_field_traces();
     test_beacon_minor();
 
     printf("\n%d checks, %d failures\n", g_checks, g_fail);

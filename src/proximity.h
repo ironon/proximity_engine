@@ -102,6 +102,32 @@
 #define HMM_PRIOR_Q8                         158      // logit(0.65) in Q8
 #define HMM_LAMBDA_MAX_Q8                    4096     // +/-16 nats saturation
 #define LL_CONNFAIL_AWAY_Q8                  (-768)   // -3.0 log-LR in Q8
+
+// Score -> log-LR mapping. NOT logit(score/256): that treats the anchor's score
+// as a calibrated posterior, which it is not. With no fingerprint yet trained
+// the score is a live Pearson correlation over whatever devices the watch and
+// anchor happened to share (in the field, 12-29 of them), and logit() claims a
+// score of 0 is 500:1 odds while being almost flat across the mid-range where
+// most real readings live. On hardware that made the filter easy to push to
+// NEAR and nearly impossible to bring back: walking away produced scores of 157
+// and 103 that contributed literally nothing, and a 79 that contributed -0.1
+// nats, so a stale NEAR belief survived the whole walk.
+//
+// A bounded linear discriminant is the honest reading of a similarity metric:
+// symmetric in both directions, proportionate in the middle, and capped so no
+// single noisy observation can claim more than it knows.
+#define HMM_EMIT_SLOPE_Q8                    8        // log-odds per score count (~0.03 nats)
+#define HMM_EMIT_MAX_Q8                      768      // +/-3 nats cap per observation,
+                                                      // same weight as LL_CONNFAIL_AWAY_Q8: an
+                                                      // unambiguous score and a refused connect
+                                                      // are comparably strong evidence
+// Scores this close to the anchor's cutoff carry no usable information and are
+// dropped, so noise around the decision point cannot accumulate into certainty
+// (the 2 cm / score-153-167 case). Deliberately much narrower than v0.8's
+// ambiguous band: that band is a *decision* rule needing hysteresis, not a claim
+// that the score is uninformative there. The HMM accumulates and lets the
+// posterior decide, so it should use the mid-range evidence v0.8 discards.
+#define HMM_EMIT_DEADZONE_U8                 PROX_NEAR_HYST_U8
 // How long a provably-still wrist must sit before the engine concedes it has
 // received ONE fresh independent fading draw. Not zero — the world moves even
 // when the wrist does not (people, doors, slow body drift below the 48 mg IA1

@@ -1118,7 +1118,15 @@ static ProxDecision hmm_fold(int32_t raw_loglr_q8, uint8_t cap_neff) {
             if (draws > 63) draws = 63;
             int32_t add = (total * (int32_t)PROX_LUT_NEFF_GAIN[draws]) >> 8;
             g_hmm_lam_q8 += add;
-            g_hmm_still_credited_q8 = add;
+            // Open a FRESH still-window budget. Carrying this tick's credit
+            // forward looked like it would stop double-counting the same
+            // observation, but it does something much worse: if the wrist then
+            // stops and the next reading disagrees, the delta spans from the old
+            // credit to the new target and lands in one step -- a swing several
+            // times larger than the one-draw ceiling the still window exists to
+            // impose. Starting at zero costs at most one extra draw of
+            // double-counting and keeps the ceiling honest.
+            g_hmm_still_credited_q8 = 0;
         } else {
             // No fresh draw — the wrist has not moved. The window's evidence is a
             // LEVEL worth at most one observation, not a per-tick increment, so
@@ -1150,32 +1158,26 @@ ProxDecision prox_hmm_tick(const ProxScoreResult2* r) {
     // pending (a failed connect is itself an observation) and still advances the
     // transition model.
     if (!r) return hmm_fold(0, 0);
-    // Measure the score against the anchor's own decision BAND, not a single
-    // point, and contribute nothing from inside it.
+    // Bounded linear discriminant about the anchor's cutoff (see HMM_EMIT_* in
+    // proximity.h for why this is not logit(score/256)).
     //
-    // Both halves are load-bearing. Centring on the anchor's cutoff rather than
-    // on score 128 preserves calibration-v2: an anchor that demonstrated its
-    // near zone ends at 210 must read 180 as evidence of being outside it.
-    // Abstaining inside the band is what stops the filter manufacturing
-    // certainty out of noise — hardware showed a watch 2 cm from its anchor
-    // scoring 153-167 against a 170 cutoff, which v0.8 correctly calls
-    // AMBIGUOUS, while this function was turning each 6-point shortfall into
-    // real evidence and accumulating it to a confident AWAY. That inverts the
-    // fail-safe: for stayNear, "I cannot tell" has to resolve to compliant.
-    //
-    // The band edges are exactly the ones prox_interpret_score() uses, so the
-    // two decision layers agree on what "uninformative" means.
+    // Three properties, each of which hardware showed was needed:
+    //  - Centred on the anchor's OWN cutoff, so calibration-v2's demonstrated
+    //    near zone is honoured rather than silently replaced by score 128.
+    //  - A dead zone around that cutoff, so noise at the decision point cannot
+    //    accumulate into certainty (a watch 2 cm from its anchor scoring
+    //    153-167 against a 170 cutoff must read AMBIGUOUS, as v0.8 does).
+    //  - Symmetric and proportionate outside it, so walking away generates real
+    //    evidence. The previous logit-difference form gave -0.1 nats for a score
+    //    of 79 while giving +1.2 for a 237, and the filter could not come back.
     uint8_t thr = r->near_thr ? r->near_thr : (uint8_t)PROX_CONFIDENCE_THRESHOLD_U8;
-    int32_t hi  = thr;                                  // at/above ⇒ evidence NEAR
-    int32_t lo  = r->near_thr ? ((int32_t)thr - PROX_NEAR_HYST_U8)  // calibrated: narrow band
-                              : (255 - (int32_t)thr);               // global rule: wide band
-    if (lo < 0)  lo = 0;
-    if (lo > hi) lo = hi;
+    int32_t d   = (int32_t)r->score - (int32_t)thr;
 
     int32_t raw;
-    if      ((int32_t)r->score >= hi) raw = (int32_t)PROX_LUT_LOGIT8[r->score] - (int32_t)PROX_LUT_LOGIT8[hi];
-    else if ((int32_t)r->score <= lo) raw = (int32_t)PROX_LUT_LOGIT8[r->score] - (int32_t)PROX_LUT_LOGIT8[lo];
-    else                              raw = 0;          // inside the band: abstain
+    if (d > HMM_EMIT_DEADZONE_U8)       raw = (d - HMM_EMIT_DEADZONE_U8) * HMM_EMIT_SLOPE_Q8;
+    else if (d < -HMM_EMIT_DEADZONE_U8) raw = (d + HMM_EMIT_DEADZONE_U8) * HMM_EMIT_SLOPE_Q8;
+    else                                raw = 0;       // inside the dead zone: abstain
+    raw = clamp_i32(raw, -HMM_EMIT_MAX_Q8, HMM_EMIT_MAX_Q8);
     return hmm_fold(raw, r->neff);
 }
 
