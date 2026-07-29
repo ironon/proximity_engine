@@ -54,6 +54,56 @@ static inline void wr_u32(uint8_t* p, uint32_t v) { p[0]=(uint8_t)v; p[1]=(uint8
 static inline void wr_f32(uint8_t* p, float f) { uint32_t u; memcpy(&u, &f, 4); wr_u32(p, u); }
 
 // ============================================================================
+// BEACON SCHEDULE — slot tagging (both roles; engine spec §3.1-§3.2)
+//
+// The anchor cycles through (channel x TX power) slots and stamps each one into
+// the iBeacon Minor field. Frequency diversity is the only diversity available
+// to a stationary watch (§1.2), and the stepped-power slots turn "can the link
+// close at reduced power" into a thresholded, amplitude-noise-immune range
+// feature. Both are free on the scan side: the watch reads the slot straight out
+// of an advertisement it was already receiving.
+// ============================================================================
+
+// Slot layout. Full schedule: 0/1/2 = ch37/38/39 at TX_HI, 3/4/5 = same at TX_LO.
+// S1b fallback: only slot ids 0 and 3 occur, each covering all three channels.
+static const uint8_t k_slot_ch[6] = { 37, 38, 39, 37, 38, 39 };
+
+uint16_t prox_beacon_minor_encode(uint8_t slot_id, uint16_t cycle_seq) {
+    return (uint16_t)(((uint16_t)(slot_id & 0x0F) << 12) | (cycle_seq & 0x0FFF));
+}
+
+int prox_beacon_minor_decode(uint16_t minor, uint8_t* out_slot, uint16_t* out_cycle) {
+    if (minor == 0x0000) return 0;          // legacy v0.8 anchor: no schedule
+    if (out_slot)  *out_slot  = (uint8_t)((minor >> 12) & 0x0F);
+    if (out_cycle) *out_cycle = (uint16_t)(minor & 0x0FFF);
+    return 1;
+}
+
+uint8_t prox_beacon_slot_channel(uint8_t slot_id) {
+#if BEACON_CHANNEL_CONTROL
+    return (slot_id < 6) ? k_slot_ch[slot_id] : 0;
+#else
+    (void)slot_id; (void)k_slot_ch;
+    return 0;                                // all three; not attributable
+#endif
+}
+
+uint8_t prox_beacon_slot_channel_map(uint8_t slot_id) {
+#if BEACON_CHANNEL_CONTROL
+    switch (slot_id % 3) {
+        case 0:  return BEACON_CH37_BIT;
+        case 1:  return BEACON_CH38_BIT;
+        default: return BEACON_CH39_BIT;
+    }
+#else
+    (void)slot_id;
+    return BEACON_CH_ALL;
+#endif
+}
+
+int prox_beacon_slot_is_lo(uint8_t slot_id) { return slot_id >= 3 ? 1 : 0; }
+
+// ============================================================================
 // MODE A — ANCHOR SIDE
 // ============================================================================
 #ifdef PROXIMITY_ROLE_ANCHOR
@@ -310,6 +360,75 @@ int prox_maybe_update_fingerprint(const ProxScanVector* watch_vec, ProxScoreResu
     g_last_train_reason = 0; // accepted
     return 1;
 }
+
+// ============================================================================
+// Beacon schedule task (anchor; §4.12)
+//
+// Timer-driven slot advance. The anchor is mains/USB powered so this is free,
+// and the TX_LO slots actually *reduce* its mean radiated power. It must never
+// interfere with connectability: proximity queries and setup have to work in
+// every slot (§4.12 item 1), which is the platform seam's responsibility.
+// ============================================================================
+
+// Schedule index, which is not the wire slot_id: under the S1b fallback the two
+// emitted slots are wire ids 0 and 3 (HI and LO), so a watch can tell a 2-slot
+// anchor from a 6-slot one purely from the set of slot ids it observes.
+static uint8_t  g_beacon_idx     = 0;
+static uint16_t g_beacon_cycle   = 1;      // never 0: see prox_beacon_minor_decode
+static uint32_t g_beacon_next_ms = 0;
+static int8_t   g_beacon_tx_hi   = 9;
+static uint8_t  g_beacon_running = 0;
+
+static uint8_t beacon_wire_slot(uint8_t idx) {
+#if BEACON_CHANNEL_CONTROL
+    return idx;                              // 0..5 map straight through
+#else
+    return idx ? 3u : 0u;                    // HI -> 0, LO -> 3
+#endif
+}
+
+static void beacon_emit(void) {
+    uint8_t slot = beacon_wire_slot(g_beacon_idx);
+    int8_t  txp  = prox_beacon_slot_is_lo(slot) ? (int8_t)BEACON_TX_LO_DBM : g_beacon_tx_hi;
+    prox_platform_set_beacon_slot(prox_beacon_slot_channel_map(slot), txp,
+                                  prox_beacon_minor_encode(slot, g_beacon_cycle));
+}
+
+void prox_beacon_schedule_init(uint8_t epoch_offset_bit, int8_t tx_hi_dbm) {
+    g_beacon_tx_hi   = tx_hi_dbm;
+    g_beacon_idx     = 0;
+    g_beacon_cycle   = 1;
+    g_beacon_running = BEACON_SCHEDULE_ENABLE ? 1u : 0u;
+    if (!g_beacon_running) return;
+    // Mode C pairs offset their epochs so their TX_LO slots never coincide —
+    // otherwise the differential measurement the two anchors exist to provide is
+    // taken while both are quiet.
+    g_beacon_next_ms = prox_platform_now_ms() +
+                       (epoch_offset_bit ? (uint32_t)BEACON_SCHEDULE_EPOCH_OFFSET_MS : 0u);
+    beacon_emit();
+}
+
+int prox_beacon_tick(void) {
+    if (!g_beacon_running) return 0;
+    uint32_t now = prox_platform_now_ms();
+    if ((int32_t)(now - g_beacon_next_ms) < 0) return 0;
+
+    g_beacon_next_ms += BEACON_SLOT_MS;
+    // If the loop was blocked long enough to miss whole slots (a long GATT
+    // operation), resync rather than replaying the backlog at full speed.
+    if ((int32_t)(now - g_beacon_next_ms) > BEACON_SLOT_MS)
+        g_beacon_next_ms = now + BEACON_SLOT_MS;
+
+    if (++g_beacon_idx >= BEACON_SLOT_COUNT) {
+        g_beacon_idx = 0;
+        if (++g_beacon_cycle > 0x0FFF) g_beacon_cycle = 1;   // skip 0, see decode
+    }
+    beacon_emit();
+    return 1;
+}
+
+uint8_t  prox_beacon_slot(void)      { return beacon_wire_slot(g_beacon_idx); }
+uint16_t prox_beacon_cycle_seq(void) { return g_beacon_cycle; }
 
 // ============================================================================
 // Calibration-v2: phase-labeled training + per-anchor threshold
@@ -641,7 +760,9 @@ static void motion_reset(void) {
 // Classify from whatever evidence is current (§4.1 table). Order matters: the
 // LOCOMOTION tests come first so an ambiguous burst can never mask real motion.
 static void motion_classify(void) {
-    if (g_motion_cadence || g_motion_burst_var > (uint32_t)IMU_LOCO_VAR ||
+    // Cadence is deliberately NOT consulted here — see IMU_CADENCE_* in
+    // proximity.h. It proved unreliable at typing amplitudes on real hardware.
+    if (g_motion_burst_var > (uint32_t)IMU_LOCO_VAR ||
         g_motion_ints >= IMU_LOCO_MIN_INTS) {
         g_motion_state = PROX_MOTION_LOCOMOTION;
         return;
@@ -1029,11 +1150,32 @@ ProxDecision prox_hmm_tick(const ProxScoreResult2* r) {
     // pending (a failed connect is itself an observation) and still advances the
     // transition model.
     if (!r) return hmm_fold(0, 0);
-    // Centre the anchor's verdict on ITS decision point, not on score 128: a
-    // calibration-v2 anchor has demonstrated where its near zone ends, and that
-    // cutoff is the score at which the evidence is genuinely neutral.
+    // Measure the score against the anchor's own decision BAND, not a single
+    // point, and contribute nothing from inside it.
+    //
+    // Both halves are load-bearing. Centring on the anchor's cutoff rather than
+    // on score 128 preserves calibration-v2: an anchor that demonstrated its
+    // near zone ends at 210 must read 180 as evidence of being outside it.
+    // Abstaining inside the band is what stops the filter manufacturing
+    // certainty out of noise — hardware showed a watch 2 cm from its anchor
+    // scoring 153-167 against a 170 cutoff, which v0.8 correctly calls
+    // AMBIGUOUS, while this function was turning each 6-point shortfall into
+    // real evidence and accumulating it to a confident AWAY. That inverts the
+    // fail-safe: for stayNear, "I cannot tell" has to resolve to compliant.
+    //
+    // The band edges are exactly the ones prox_interpret_score() uses, so the
+    // two decision layers agree on what "uninformative" means.
     uint8_t thr = r->near_thr ? r->near_thr : (uint8_t)PROX_CONFIDENCE_THRESHOLD_U8;
-    int32_t raw = (int32_t)PROX_LUT_LOGIT8[r->score] - (int32_t)PROX_LUT_LOGIT8[thr];
+    int32_t hi  = thr;                                  // at/above ⇒ evidence NEAR
+    int32_t lo  = r->near_thr ? ((int32_t)thr - PROX_NEAR_HYST_U8)  // calibrated: narrow band
+                              : (255 - (int32_t)thr);               // global rule: wide band
+    if (lo < 0)  lo = 0;
+    if (lo > hi) lo = hi;
+
+    int32_t raw;
+    if      ((int32_t)r->score >= hi) raw = (int32_t)PROX_LUT_LOGIT8[r->score] - (int32_t)PROX_LUT_LOGIT8[hi];
+    else if ((int32_t)r->score <= lo) raw = (int32_t)PROX_LUT_LOGIT8[r->score] - (int32_t)PROX_LUT_LOGIT8[lo];
+    else                              raw = 0;          // inside the band: abstain
     return hmm_fold(raw, r->neff);
 }
 

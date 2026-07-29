@@ -527,6 +527,181 @@ static void test_coloc(void) {
     CHECK(d.state == before, "a still watch flipped on an RSSI excursion (p=%.2f)", d.p_near);
 }
 
+
+// ---------------------------------------------------------------- hardware regressions
+
+// Feed a burst with a target gravity-removed variance, so tests can be written
+// in the units Spike S3 actually measured on a wrist.
+static void feed_var(uint32_t target_var) {
+    // feed_burst's square wave gives var ~= amp^2 * (1 + 1/4 + 1/9); solve for amp.
+    double amp = sqrt((double)target_var / 1.361);
+    feed_burst((int)(amp + 0.5), 0);
+}
+
+static void test_s3_measured_classes(void) {
+    begin("S3: measured wrist variances land in the right motion classes");
+
+    // Numbers straight from the 2026-07-28 bench run on a real wrist.
+    const uint32_t desk[]   = { 9, 22, 34 };
+    const uint32_t still[]  = { 95, 120, 150, 291, 338 };
+    const uint32_t typing[] = { 756, 1730, 2253, 3616, 4679, 7404, 9278, 9788 };
+    const uint32_t walk[]   = { 19645, 20242, 27357, 51111, 105445, 415024 };
+
+    for (size_t i = 0; i < sizeof(desk)/sizeof(desk[0]); ++i) {
+        prox_hmm_reset(PROX_CRIT_STAY_NEAR); feed_var(desk[i]);
+        CHECK(prox_motion_state() == PROX_MOTION_STILL, "desk var %u => STILL, got %u",
+              desk[i], prox_motion_state());
+    }
+    for (size_t i = 0; i < sizeof(still)/sizeof(still[0]); ++i) {
+        prox_hmm_reset(PROX_CRIT_STAY_NEAR); feed_var(still[i]);
+        CHECK(prox_motion_state() == PROX_MOTION_STILL, "worn-still var %u => STILL, got %u",
+              still[i], prox_motion_state());
+    }
+    // The regression the user hit: ~50% of typing read as LOCOMOTION, because
+    // the cadence flag flipped on noise at these amplitudes.
+    for (size_t i = 0; i < sizeof(typing)/sizeof(typing[0]); ++i) {
+        prox_hmm_reset(PROX_CRIT_STAY_NEAR); feed_var(typing[i]);
+        CHECK(prox_motion_state() == PROX_MOTION_FIDGET, "typing var %u => FIDGET, got %u",
+              typing[i], prox_motion_state());
+    }
+    for (size_t i = 0; i < sizeof(walk)/sizeof(walk[0]); ++i) {
+        prox_hmm_reset(PROX_CRIT_STAY_NEAR); feed_var(walk[i]);
+        CHECK(prox_motion_state() == PROX_MOTION_LOCOMOTION, "walking var %u => LOCOMOTION, got %u",
+              walk[i], prox_motion_state());
+    }
+}
+
+static void test_ambiguous_band_abstains(void) {
+    begin("REGRESSION: scores inside the anchor's band never accumulate certainty");
+
+    // The A2 trace: watch 2 cm from its anchor, scores 153-167 against a cutoff
+    // of 170 -- i.e. inside the anchor's own hysteresis band, which v0.8 calls
+    // AMBIGUOUS. v2 was converting each 3-17 point shortfall into evidence and
+    // marching to lam=-800: a confident AWAY, which for stayNear inverts the
+    // fail-safe from compliant to alarming.
+    const uint8_t observed[] = { 159, 160, 162, 163, 164, 167, 153, 156 };
+
+    prox_hmm_reset(PROX_CRIT_STAY_NEAR);
+    int32_t start = prox_hmm_logodds_q8();
+    for (int rep = 0; rep < 20; ++rep) {
+        for (size_t i = 0; i < sizeof(observed)/sizeof(observed[0]); ++i) {
+            advance_ms(5000);
+            feed_loco();                      // full draw credit: the worst case
+            ProxScoreResult2 r = mk(observed[i], /*near_thr=*/170);
+            prox_hmm_tick(&r);
+        }
+    }
+    // The posterior may DRIFT TOWARD 0 here — that is the transition model
+    // correctly forgetting an old belief while the wrist moves and nothing
+    // informative arrives. What must not happen is it acquiring certainty in
+    // either direction off the back of in-band scores.
+    int32_t lam = prox_hmm_logodds_q8();
+    CHECK(lam <= start && lam > HMM_TAU_AWAY_Q8,
+          "160 in-band scores must not build certainty: %d -> %d", (int)start, (int)lam);
+    CHECK(prox_hmm_decision() == PROX_HMM_AMBIGUOUS,
+          "in-band scores must read AMBIGUOUS, got %d", (int)prox_hmm_decision());
+
+    begin("...but scores outside the band still decide, in both directions");
+    prox_hmm_reset(PROX_CRIT_STAY_NEAR);
+    for (int i = 0; i < 6; ++i) {
+        advance_ms(5000); feed_loco();
+        ProxScoreResult2 r = mk(240, 170);
+        prox_hmm_tick(&r);
+    }
+    CHECK(prox_hmm_decision() == PROX_HMM_NEAR, "a clearly-near score must reach NEAR (lam=%d)",
+          (int)prox_hmm_logodds_q8());
+
+    prox_hmm_reset(PROX_CRIT_STAY_NEAR);
+    for (int i = 0; i < 6; ++i) {
+        advance_ms(5000); feed_loco();
+        ProxScoreResult2 r = mk(10, 170);
+        prox_hmm_tick(&r);
+    }
+    CHECK(prox_hmm_decision() == PROX_HMM_AWAY, "a clearly-far score must reach AWAY (lam=%d)",
+          (int)prox_hmm_logodds_q8());
+
+    begin("...and a score below the band still counts, matching v0.8");
+    // Scores of 133/145 appeared in the same trace, measured from across the
+    // room. Those sit below the band and must remain informative -- abstaining
+    // everywhere would be just as wrong as never abstaining. v0.8 calls these
+    // AWAY too, so the two layers agree.
+    // Note this takes more ticks than v0.8's instant threshold: a score just
+    // outside the band is genuinely weak evidence (the score->logit map is flat
+    // near the middle), so the filter accumulates rather than jumping. That is
+    // the intended behavior, not a shortfall.
+    prox_hmm_reset(PROX_CRIT_STAY_NEAR);
+    for (int i = 0; i < 12; ++i) {
+        advance_ms(5000); feed_loco();
+        ProxScoreResult2 r = mk(133, 170);
+        prox_hmm_tick(&r);
+    }
+    CHECK(prox_hmm_decision() == PROX_HMM_AWAY,
+          "a below-band score must still drive AWAY (lam=%d)", (int)prox_hmm_logodds_q8());
+
+    begin("...and the band narrows to a calibrated anchor's demonstrated cutoff");
+    // A calibrated anchor gets the narrow hysteresis band, so a score 30 below a
+    // demonstrated cutoff of 210 IS informative -- where the same score sits
+    // in-band under the wide global rule.
+    prox_hmm_reset(PROX_CRIT_STAY_NEAR);
+    for (int i = 0; i < 6; ++i) {
+        advance_ms(5000); feed_loco();
+        ProxScoreResult2 r = mk(180, /*near_thr=*/210);
+        prox_hmm_tick(&r);
+    }
+    CHECK(prox_hmm_logodds_q8() < 0, "below a demonstrated cutoff => AWAY evidence (lam=%d)",
+          (int)prox_hmm_logodds_q8());
+}
+
+// ---------------------------------------------------------------- P2: beacon schedule
+
+static void test_beacon_minor(void) {
+    begin("beacon Minor: round-trips slot id and cycle sequence");
+    for (int slot = 0; slot < 6; ++slot) {
+        for (uint16_t cyc = 1; cyc < 0x1000; cyc += 37) {
+            uint16_t m = prox_beacon_minor_encode((uint8_t)slot, cyc);
+            uint8_t gs = 0xFF; uint16_t gc = 0xFFFF;
+            CHECK(prox_beacon_minor_decode(m, &gs, &gc) == 1, "slot %d cyc %u should decode", slot, cyc);
+            CHECK(gs == slot && gc == cyc, "round-trip slot %d cyc %u -> %u/%u", slot, cyc, gs, gc);
+        }
+    }
+
+    begin("beacon Minor: an all-zero Minor is 'no schedule', not slot 0 cycle 0");
+    // A v0.8 anchor emits Minor 0x0000 forever. If cycle_seq could be 0 the
+    // watch could not tell that apart from a real slot-0 tag, and would
+    // attribute phantom slots to an anchor that has no schedule at all.
+    uint8_t s2 = 0xFF; uint16_t c2 = 0xFFFF;
+    CHECK(prox_beacon_minor_decode(0x0000, &s2, &c2) == 0, "legacy Minor must not decode");
+    CHECK(prox_beacon_minor_encode(0, 1) != 0x0000, "the live schedule never emits 0x0000");
+
+    begin("beacon Minor: slot id occupies the high nibble of the first on-air byte");
+    // iBeacon sends Major/Minor big-endian, so the anchor writes msd[22]=minor>>8.
+    // The slot id must land in the high nibble there -- the byte order the
+    // amendment (Part 3) singles out as error-prone.
+    uint16_t m = prox_beacon_minor_encode(5, 0x0AB);
+    CHECK((uint8_t)((m >> 8) >> 4) == 5, "slot id in high nibble of first byte, got 0x%02X",
+          (uint8_t)(m >> 8));
+    CHECK((m & 0x0FFF) == 0x0AB, "cycle survives in the low 12 bits, got 0x%03X", m & 0x0FFF);
+
+    begin("beacon slots: TX_LO slots are the ones PDR is measured over");
+    CHECK(!prox_beacon_slot_is_lo(0) && !prox_beacon_slot_is_lo(2), "slots 0-2 are TX_HI");
+    CHECK(prox_beacon_slot_is_lo(3) && prox_beacon_slot_is_lo(5), "slots 3-5 are TX_LO");
+
+    begin("beacon slots: channel attribution follows the S1b build switch");
+#if BEACON_CHANNEL_CONTROL
+    CHECK(prox_beacon_slot_channel(0) == 37 && prox_beacon_slot_channel(2) == 39,
+          "full schedule attributes channels");
+    CHECK(prox_beacon_slot_channel_map(1) == BEACON_CH38_BIT, "slot 1 maps to ch38 only");
+    CHECK(BEACON_SLOT_COUNT == 6, "full schedule has 6 slots");
+#else
+    // Under the fallback the watch must be told the channel is unknown rather
+    // than handed a plausible-looking wrong answer.
+    CHECK(prox_beacon_slot_channel(0) == 0 && prox_beacon_slot_channel(4) == 0,
+          "fallback reports channel unknown");
+    CHECK(prox_beacon_slot_channel_map(0) == BEACON_CH_ALL, "fallback uses all channels");
+    CHECK(BEACON_SLOT_COUNT == 2, "fallback has 2 slots");
+#endif
+}
+
 // ----------------------------------------------------------------------------
 
 int main(void) {
@@ -544,6 +719,9 @@ int main(void) {
     test_teleport_rejection();
     test_imu_stale();
     test_coloc();
+    test_s3_measured_classes();
+    test_ambiguous_band_abstains();
+    test_beacon_minor();
 
     printf("\n%d checks, %d failures\n", g_checks, g_fail);
     return g_fail ? 1 : 0;

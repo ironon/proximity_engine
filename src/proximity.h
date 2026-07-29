@@ -42,16 +42,29 @@
 // is 1 mg/LSB, so mg^2 and LSB^2 are the same number here.
 #define IMU_BURST_SAMPLES                    32
 #define IMU_BURST_HZ                         50
-// S3-tuned. Until S3 lands these are deliberately conservative: STILL is hard to
-// declare and misclassification lands on LOCOMOTION, which fails toward v0.8
-// behavior rather than toward a frozen decision.
+// Measured on a real wrist, 2026-07-28 (Spike S3, first pass). The classes
+// separate cleanly on variance alone, with a wide empty gap between them:
+//
+//     desk, untouched      9 -    34 mg^2
+//     worn, sitting still 95 -   338
+//     typing             756 -  9278
+//     walking          19645 - 415024
+//
+// So STILL sits well under 400 and the typing/walking gap is 9.3k..19.6k.
+// IMU_LOCO_VAR is placed in that gap rather than at the original guess of
+// 40000, which sat above much of real walking.
 #define IMU_STILL_VAR                        400      // (20 mg RMS)^2
-#define IMU_LOCO_VAR                         40000    // (200 mg RMS)^2
+#define IMU_LOCO_VAR                         15000    // (~122 mg RMS)^2, S3-measured gap
 #define IMU_LOCO_MIN_INTS                    2
 #define IMU_STALE_MS                         5000
-// Step-cadence detection inside one burst (0.5-3 Hz over IMU_BURST_SAMPLES /
-// IMU_BURST_HZ seconds of signal), guarded by a variance floor so sensor noise
-// cannot manufacture crossings.
+// Step-cadence detection inside one burst. RETIRED AS A CLASSIFIER INPUT: the
+// same S3 pass showed it flipping on noise at typing amplitudes — bursts of
+// var 9278 and 9788, physically indistinguishable, were separated only by this
+// flag and landed in different classes, which is what made ~50% of typing read
+// as LOCOMOTION. Variance alone separates the classes with a 2x gap, so cadence
+// bought nothing and cost accuracy. Still computed and exposed via
+// prox_motion_burst_cadence() as raw data for the full S3 confusion matrix, but
+// it no longer decides anything.
 #define IMU_CADENCE_MIN_CROSSINGS            2
 #define IMU_CADENCE_MAX_CROSSINGS            8
 #define IMU_CADENCE_MIN_VAR                  900      // (30 mg RMS)^2
@@ -107,6 +120,42 @@
 // poll interval off this far. The IA1 interrupt still forces an immediate
 // re-check, so responsiveness is unchanged.
 #define ENFORCEMENT_POLL_INTERVAL_STILL_S    600
+
+// ── Phase 2: beacon schedule (anchor) ───────────────────────────────────────
+// Engine spec §3.1-§3.2; amendment Parts 3, 4, 14.
+//
+// The anchor rotates through (channel x TX power) slots and tags each one in the
+// iBeacon Minor field, constant 0x0000 since v1. That gives the watch
+// per-channel RSSI and a stepped-power packet-delivery ratio with zero
+// controller support on the scan side — the only two forms of diversity a
+// stationary receiver can actually get (§1.2).
+#define BEACON_SCHEDULE_ENABLE               1
+#define BEACON_SLOT_MS                       250      // S2 fallback: 500
+#define BEACON_ADV_INTERVAL_MS               50
+#define BEACON_TX_LO_DBM                     (-21)    // placeholder until S1a measures it
+#define BEACON_SCHEDULE_EPOCH_OFFSET_MS      750      // Mode C anchor-pair phase offset
+#define BEACON_CYCLE_MS                      (BEACON_SLOT_MS * BEACON_SLOT_COUNT)
+
+// Per-slot channel restriction. Spike S1b found the capability IS available on
+// this NimBLE (contrary to the amendment's premise) by two routes, but its pass
+// criterion — adverts observed on exactly one channel, anchor still connectable,
+// legacy scanners unaffected — is an on-air check that has not been made. Until
+// it has, ship the power-only 2-slot schedule: PDR never needed channel
+// attribution (§3.4), so this is a reduced feature set, not a broken one.
+// See tests/prox_v2_spikes.md before changing this to 1.
+#define BEACON_CHANNEL_CONTROL               0
+
+#if BEACON_CHANNEL_CONTROL
+  #define BEACON_SLOT_COUNT                  6
+#else
+  #define BEACON_SLOT_COUNT                  2        // slot_id 0 (HI) and 3 (LO)
+#endif
+
+// Channel-map bits as the BLE HCI layer expects them (ch37 = bit0).
+#define BEACON_CH37_BIT                      0x01u
+#define BEACON_CH38_BIT                      0x02u
+#define BEACON_CH39_BIT                      0x04u
+#define BEACON_CH_ALL                        0x07u
 
 // Motion states — same encoding as the P2 vector trailer's motion_state byte.
 #define PROX_MOTION_STILL       0u
@@ -347,6 +396,26 @@ extern "C" {
 // ---- common ----
 void prox_init(void);
 
+// ---- Beacon-schedule slot tagging (both roles; engine spec §3.2) ----
+// Minor = (slot_id << 12) | (cycle_seq & 0x0FFF). Transmitted big-endian on air
+// per iBeacon convention, so slot_id lands in the high nibble of the FIRST Minor
+// byte — see the round-trip test before touching the byte order.
+//
+// cycle_seq deliberately never takes the value 0: an all-zero Minor is what a
+// v0.8 anchor emits, and a watch must be able to read it as "no schedule" rather
+// than as slot 0 of cycle 0. decode() returns 0 for that case and the engine
+// degrades to Phase-1 behavior.
+uint16_t prox_beacon_minor_encode(uint8_t slot_id, uint16_t cycle_seq);
+int      prox_beacon_minor_decode(uint16_t minor, uint8_t* out_slot, uint16_t* out_cycle);
+
+// Slot -> physical meaning. channel() gives 37/38/39, or 0 when the slot covers
+// all three (the S1b fallback); channel_map() gives the HCI bitmap; is_lo() is 1
+// for the reduced-power slots that PDR is measured over.
+uint8_t  prox_beacon_slot_channel(uint8_t slot_id);
+uint8_t  prox_beacon_slot_channel_map(uint8_t slot_id);
+int      prox_beacon_slot_is_lo(uint8_t slot_id);
+
+
 // ---- Mode A: anchor side ----
 #ifdef PROXIMITY_ROLE_ANCHOR
 // Called by the platform BLE/WiFi scan callbacks to update the live cache.
@@ -376,6 +445,26 @@ void            prox_set_self_mac(const uint8_t mac[6]);
 // Optional: tell this anchor the MACs of peer anchors, so the self-supervised
 // training gate can reject boundary samples that are ambiguous between anchors.
 void            prox_set_peer_anchor_macs(const uint8_t macs[][6], int count);
+
+// ---- Phase 2: beacon schedule (anchor side) ----
+// Engine -> platform seam (engine spec §10). Called by the engine on every slot
+// boundary; the platform performs the advertising stop -> reconfigure (channel
+// map, TX power, Minor) -> start sequence. channel_map is BEACON_CH_ALL under
+// the S1b fallback, and the platform is free to ignore it in that case.
+void     prox_platform_set_beacon_slot(uint8_t channel_map, int8_t tx_power_dbm,
+                                       uint16_t minor);
+
+// Start the schedule. epoch_offset_bit comes from the anchor UUID's low bit, so
+// a Mode C anchor pair phase-offsets its cycles by BEACON_SCHEDULE_EPOCH_OFFSET_MS
+// and their TX_LO slots do not collide (§4.12 item 4).
+void     prox_beacon_schedule_init(uint8_t epoch_offset_bit, int8_t tx_hi_dbm);
+// Advance the schedule if the current slot has expired. Cheap and idempotent —
+// safe to call from the anchor's main loop as often as it likes; it acts only on
+// a slot boundary. Returns 1 if a slot change was emitted.
+int      prox_beacon_tick(void);
+// Current slot id (0..5; only 0 and 3 occur under the fallback) and cycle count.
+uint8_t  prox_beacon_slot(void);
+uint16_t prox_beacon_cycle_seq(void);
 
 // ---- Calibration-v2 (anchor side) ----
 // Phase-labeled training: fold the vector into the fingerprint at full weight,
