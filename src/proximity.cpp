@@ -144,6 +144,9 @@ static uint32_t  g_calib_inside_n = 0;
 static uint32_t  g_calib_edge_n   = 0;
 
 static const char* PROX_NVS_KEY = "prox_fp";
+// Separate key on purpose: the fingerprint blob has its own format and
+// migrating it to carry two extra bytes would risk every existing anchor.
+static const char* PROX_SELF_NVS_KEY = "prox_self";
 
 static AnchorDev* reg_find(const uint8_t mac[6], uint8_t type) {
     for (int i = 0; i < g_reg_count; ++i)
@@ -152,9 +155,72 @@ static AnchorDev* reg_find(const uint8_t mac[6], uint8_t type) {
     return NULL;
 }
 
+static int dev_is_fresh(const AnchorDev* d, uint32_t now);
+
+// BLE Resolvable Private Address: the top two bits of the MSB are 0b01. Both
+// roles store addresses big-endian (on-air order), so mac[0] is the MSB.
+//
+// This matters more than it looks. Essentially every modern phone, watch,
+// earbud and fitness device re-randomises its BLE address every ~15 minutes for
+// privacy. Such a device is perfectly usable for the LIVE correlation -- within
+// one rotation period the watch and the anchor genuinely see the same address --
+// but it is worthless as a FINGERPRINT key, because the address it was trained
+// under is dead within the quarter hour. WiFi BSSIDs, by contrast, are static,
+// and so are public-address BLE devices (TVs, smart-home gear, beacons).
+static int mac_is_rotating(const uint8_t mac[6], uint8_t type) {
+    if (type != PROX_TYPE_BLE) return 0;          // BSSIDs never rotate
+    return (mac[0] & 0xC0) == 0x40;
+}
+
+// Pick the least valuable registry slot to recycle, or NULL if every slot is
+// genuinely worth keeping.
+//
+// Without this the registry was a one-way street: it filled to
+// ANCHOR_PROX_MAX_FINGERPRINT_DEVICES and reg_add() then refused every new
+// device FOREVER. Combined with address rotation the anchor saturated with dead
+// addresses within minutes and went permanently blind to its own room -- field
+// logs showed it sharing 0-4 devices with a watch sitting beside it that was
+// reporting 29. Nothing downstream can recover from that: Signal A had no
+// sample, so the score was arithmetic rather than measurement.
+static AnchorDev* reg_evict(uint32_t now) {
+    int worst = -1;
+
+    // Pass 1: something neither live nor trained. Rotating addresses first --
+    // a stale RPA is guaranteed never to be seen again under that address.
+    for (int i = 0; i < g_reg_count; ++i) {
+        AnchorDev* d = &g_reg[i];
+        if (!d->in_use || dev_is_fresh(d, now)) continue;
+        if (d->W >= PROX_MIN_FINGERPRINT_WEIGHT) continue;
+        if (worst < 0) { worst = i; continue; }
+        AnchorDev* b = &g_reg[worst];
+        int d_rot = mac_is_rotating(d->mac, d->type), b_rot = mac_is_rotating(b->mac, b->type);
+        if (d_rot != b_rot) { if (d_rot) worst = i; continue; }
+        if (d->last_seen_ms < b->last_seen_ms) worst = i;
+    }
+    if (worst >= 0) return &g_reg[worst];
+
+    // Pass 2: everything left is trained. Give up the stalest, lightest one --
+    // still preferring rotating addresses, whose training cannot be reused.
+    for (int i = 0; i < g_reg_count; ++i) {
+        AnchorDev* d = &g_reg[i];
+        if (!d->in_use || dev_is_fresh(d, now)) continue;
+        if (worst < 0) { worst = i; continue; }
+        AnchorDev* b = &g_reg[worst];
+        int d_rot = mac_is_rotating(d->mac, d->type), b_rot = mac_is_rotating(b->mac, b->type);
+        if (d_rot != b_rot) { if (d_rot) worst = i; continue; }
+        if (d->W < b->W) worst = i;
+    }
+    return worst >= 0 ? &g_reg[worst] : NULL;   // all fresh: legitimately full
+}
+
 static AnchorDev* reg_add(const uint8_t mac[6], uint8_t type) {
-    if (g_reg_count >= ANCHOR_PROX_MAX_FINGERPRINT_DEVICES) return NULL; // cap: ignore new
-    AnchorDev* d = &g_reg[g_reg_count++];
+    AnchorDev* d;
+    if (g_reg_count < ANCHOR_PROX_MAX_FINGERPRINT_DEVICES) {
+        d = &g_reg[g_reg_count++];
+    } else {
+        d = reg_evict(prox_platform_now_ms());
+        if (!d) return NULL;                    // every slot is live; genuinely full
+    }
     memset(d, 0, sizeof(*d));
     memcpy(d->mac, mac, 6);
     d->type = type;
@@ -200,8 +266,25 @@ static int vec_lookup(const ProxScanVector* v, const uint8_t mac[6], uint8_t typ
     return 0;
 }
 
+// Per-query diagnostics. These two numbers are what make a bad score legible:
+// g_last_shared is the sample size Signal A actually had, and g_last_fp_seen is
+// the sample size Signal B actually had. A score without them is unfalsifiable.
+static int g_last_shared = 0;
+static int g_last_fp_seen = 0;
+
 // Signal A: Pearson correlation over devices shared by watch vector and fresh cache.
-static int signal_correlation(const ProxScanVector* v, float* out_rho) {
+//
+// The k >= PROX_MIN_SHARED_DEVICES guard is not a nicety, it is the difference
+// between a measurement and a coin flip. Pearson's r over k points is DEGENERATE
+// at small k: with k == 2 the two points always lie exactly on a line, so r is
+// mathematically +/-1 regardless of what was measured, and after the clamp to
+// [0,1] the score is exactly 0 or exactly 255. Field logs showed precisely that
+// signature -- a still watch beside a still anchor producing 0, 0, 255, 0, 255,
+// 0 -- which is not "noise", it is the estimator reporting the arithmetic of
+// having too few points. Even at k = 5 the standard error is around 1/sqrt(k-3),
+// i.e. most of the output range. Below the floor the correlation abstains and
+// the caller falls back to the fingerprint or reports a neutral score.
+static int signal_correlation(const ProxScanVector* v, float* out_rho, int* out_k) {
     uint32_t now = prox_platform_now_ms();
     float sw = 0, sa = 0; int k = 0;
     // pass 1: means
@@ -210,7 +293,8 @@ static int signal_correlation(const ProxScanVector* v, float* out_rho) {
         if (!d || !dev_is_fresh(d, now)) continue;
         sw += v->devices[i].rssi; sa += d->live_rssi; k++;
     }
-    if (k < 2) { *out_rho = 0.0f; return 0; }
+    if (out_k) *out_k = k;
+    if (k < PROX_MIN_SHARED_DEVICES) { *out_rho = 0.0f; return 0; }
     float mw = sw / k, ma = sa / k;
     // pass 2: covariance / variances
     float cov = 0, vw = 0, va = 0;
@@ -239,12 +323,42 @@ static int signal_fingerprint(const ProxScanVector* v, float* out_L, float* out_
         wtot += d->W;
         if (!d->fp_active) continue;
         int8_t x;
-        if (!vec_lookup(v, d->mac, d->type, &x)) x = PROX_MISSING_RSSI_DBM;
+        // A fingerprinted device missing from this vector is CENSORED, not
+        // observed at PROX_MISSING_RSSI_DBM. Imputing -100 was the single
+        // largest noise term in the score: a device with mu=-70, sigma=6 that
+        // merely failed to advertise inside the watch's scan window scored
+        // dx^2/2sigma^2 = 12.5 nats of penalty while sitting motionless a metre
+        // away. Since a device can go missing either by being too weak OR by
+        // being asynchronous, "absent" carries no clean evidence in either
+        // direction, so it abstains — it contributes to neither loglik nor nb.
+        // Far-evidence is not lost: it still arrives through Signal A and
+        // through the nb < PROX_MIN_DEVICE_COUNT guard below, which now counts
+        // devices actually *present* rather than devices merely enrolled.
+        if (!vec_lookup(v, d->mac, d->type, &x)) continue;
         float dx = (float)x - d->mu;
-        loglik += d->lognorm - dx * dx * d->inv2var;
+        // Mean standardised residual, NOT the mean log-density. The Gaussian
+        // normalisation term (d->lognorm = -0.5*ln(var) - ln(sqrt(2pi))) is a
+        // property of the FINGERPRINT'S WIDTH, not of how well this vector
+        // matched it, and it dominated the average: a *perfect* match scored
+        // L = 0.67 at sigma = 2 dB and only 0.47 at sigma = 10 dB, so L could
+        // never approach 1 and the fingerprint could only ever drag the score
+        // DOWN from Signal A's.
+        //
+        // Measured consequence, reproduced on host: one unchanged NEAR vector
+        // scored 245 untrained, 211 after 16 training samples, 153 after 80 and
+        // 138 after 160, decaying toward L*255 as alpha handed control to
+        // Signal B. The score therefore had no stable scale — it drifted
+        // downward over an anchor's lifetime, so a threshold calibrated one week
+        // was wrong the next, and a calibration's own INSIDE mean (153) landed
+        // 70 points below the live scores (223) it was collected from.
+        //
+        // The standardised residual is scale-free: 0 for a perfect match,
+        // -0.5 at 1 sigma, -2 at 2 sigma, -4.5 at 3 sigma, whatever the width.
+        loglik += -dx * dx * d->inv2var;
         nb++;
     }
     *out_wtot = wtot;
+    g_last_fp_seen = nb;
     if (nb < PROX_MIN_DEVICE_COUNT) { *out_L = 0.0f; return 0; }
     float avg = loglik / (float)nb;
     *out_L = logistic((avg - PROX_LL_CENTER) * PROX_LL_SCALE);
@@ -268,8 +382,47 @@ int prox_deserialize_vector(const uint8_t* buf, size_t len, ProxScanVector* out)
     return 1;
 }
 
+// ---- self-RSSI discriminant -------------------------------------------------
+// Learned near/away beacon levels for THIS anchor, from the two calibration legs.
+// Zero/invalid until a calibration has run, in which case the term abstains and
+// the score is bit-identical to what it was before this feature existed.
+static int8_t g_self_near_dbm  = 0;
+static int8_t g_self_away_dbm  = 0;
+static uint8_t g_self_cal_valid = 0;
+static int    g_last_self_delta = 0;
+
+int prox_self_levels(int8_t* out_near, int8_t* out_away) {
+    if (out_near) *out_near = g_self_cal_valid ? g_self_near_dbm : 0;
+    if (out_away) *out_away = g_self_cal_valid ? g_self_away_dbm : 0;
+    return g_self_cal_valid ? 1 : 0;
+}
+int prox_last_self_delta(void) { return g_last_self_delta; }
+
+// Bounded, asymmetric score adjustment from the anchor's own beacon level.
+// Linear in dB between the two demonstrated levels, clamped hard at both ends —
+// and clamped TIGHTER on the way down, because a weak reading is what both
+// distance and a duvet produce (see PROX_SELF_UP_MAX_U8).
+static int self_score_delta(const ProxScanVector* v) {
+    if (!g_self_cal_valid || !g_have_self) return 0;
+    int8_t self_rssi;
+    if (!vec_lookup(v, g_self_mac, PROX_TYPE_BLE, &self_rssi)) return 0;
+
+    const int span = (int)g_self_near_dbm - (int)g_self_away_dbm;   // > 0
+    if (span < PROX_SELF_MIN_SPAN_DB) return 0;                     // not separable by level
+
+    const int mid  = ((int)g_self_near_dbm + (int)g_self_away_dbm) / 2;
+    const int half = span / 2;
+
+    // Full deflection at the demonstrated level, proportional in between.
+    int d = ((int)self_rssi - mid) * (int)PROX_SELF_UP_MAX_U8 / half;
+    if (d >  (int)PROX_SELF_UP_MAX_U8)    d =  (int)PROX_SELF_UP_MAX_U8;
+    if (d < -(int)PROX_SELF_DOWN_MAX_U8)  d = -(int)PROX_SELF_DOWN_MAX_U8;
+    return d;
+}
+
 ProxScoreResult prox_compute_score(const ProxScanVector* watch_vec) {
     ProxScoreResult r = { 0, 0 };
+    g_last_self_delta = 0;
 
     // Low-device-count fallback: single raw RSSI comparison to self.
     if (watch_vec->count < PROX_MIN_DEVICE_COUNT) {
@@ -283,14 +436,38 @@ ProxScoreResult prox_compute_score(const ProxScanVector* watch_vec) {
         return r;
     }
 
-    float rho; signal_correlation(watch_vec, &rho);
+    float rho; int k = 0;
+    int have_rho = signal_correlation(watch_vec, &rho, &k);
     float L, wtot; int have_fp = signal_fingerprint(watch_vec, &L, &wtot);
+    g_last_shared = k;
 
+    // Neither signal has enough to say anything. Report the criterion-neutral
+    // midpoint rather than a number: 0 would read as confident AWAY, and an
+    // absent measurement is not evidence of distance (the same asymmetry the
+    // engine spec's occlusion section states normatively -- an unobserved
+    // environment can only ever fake "far").
+    if (!have_rho && !have_fp) {
+        r.flags |= PROX_FLAG_LOW_DEVICE_COUNT;
+        r.score = PROX_STARVED_SCORE;
+        return r;
+    }
+
+    // Whichever signal survived carries the weight; alpha only mediates between
+    // them when both are actually available.
     float alpha = have_fp ? expf(-wtot / PROX_ALPHA_W0) : 1.0f;
+    if (!have_rho) alpha = 0.0f;
     float score_f = alpha * rho + (1.0f - alpha) * L;
     score_f = clampf(score_f, 0.0f, 1.0f);
 
-    r.score = (uint8_t)(score_f * 255.0f + 0.5f);
+    int s = (int)(score_f * 255.0f + 0.5f);
+
+    // The anchor's own beacon level, which neither signal above can see.
+    g_last_self_delta = self_score_delta(watch_vec);
+    s += g_last_self_delta;
+    if (s < 0)   s = 0;
+    if (s > 255) s = 255;
+
+    r.score = (uint8_t)s;
     if (have_fp) r.flags |= PROX_FLAG_FINGERPRINT_ACTIVE;
     return r;
 }
@@ -312,7 +489,23 @@ static void dev_welford(AnchorDev* d, float x, float w) {
 static int    g_last_train_reason = -1;
 static int8_t g_last_self_rssi    = 0;
 int    prox_last_train_reason(void) { return g_last_train_reason; }
+int    prox_last_shared_count(void) { return g_last_shared; }
+int    prox_last_fp_seen(void)      { return g_last_fp_seen; }
 int8_t prox_last_self_rssi(void)    { return g_last_self_rssi; }
+
+// The anchor's own beacon level as it appears in a GIVEN vector. Distinct from
+// prox_last_self_rssi(), which is a leftover of the passive-training path and
+// reads 0 on every calibration query because that path never runs there — a
+// diagnostic that cost two separate investigations by looking like a
+// measurement. Returns 0 when the anchor is absent from the vector, which is
+// itself the thing worth logging: it is what silently disarms the self-RSSI
+// discriminant.
+int8_t prox_vector_self_rssi(const ProxScanVector* v) {
+    int8_t s;
+    if (!v || !g_have_self) return 0;
+    if (!vec_lookup(v, g_self_mac, PROX_TYPE_BLE, &s)) return 0;
+    return s;
+}
 
 // Is the sample unambiguous? Requires self present and beating any known peer
 // anchor by PROX_COLLECT_AMBIGUITY_MARGIN_DBM. If no peers are known, the self
@@ -344,6 +537,10 @@ int prox_maybe_update_fingerprint(const ProxScanVector* watch_vec, ProxScoreResu
     for (int i = 0; i < g_reg_count; ++i) {
         AnchorDev* d = &g_reg[i];
         if (!d->in_use) continue;
+        // Rotating (resolvable-private) addresses stay in the registry as live
+        // correlation coordinates but never earn fingerprint weight -- the key
+        // they would be trained under expires in ~15 minutes.
+        if (mac_is_rotating(d->mac, d->type)) continue;
         int8_t x;
         if (vec_lookup(watch_vec, d->mac, d->type, &x))
             dev_welford(d, (float)x, score_f);
@@ -462,11 +659,81 @@ int prox_train_labeled(const ProxScanVector* v, int is_inside) {
     return 1;
 }
 
+// ── Deferred calibration scoring ────────────────────────────────────────────
+// See PROX_CALIB_BUF_SAMPLES in proximity.h for the measurement that forced this.
+typedef struct {
+    uint8_t    count;
+    ProxDevice dev[PROX_CALIB_BUF_DEVICES];
+} CalibSample;
+static CalibSample g_calib_buf[2][PROX_CALIB_BUF_SAMPLES];  // [0] EDGE, [1] INSIDE
+static uint8_t     g_calib_buf_n[2]   = {0, 0};             // retained
+static uint32_t    g_calib_offered[2] = {0, 0};             // total offered (reservoir denominator)
+static uint32_t    g_calib_rng        = 0x2545F491u;
+
+static uint32_t calib_rand(void) {          // xorshift32; only needs to be unbiased
+    g_calib_rng ^= g_calib_rng << 13;
+    g_calib_rng ^= g_calib_rng >> 17;
+    g_calib_rng ^= g_calib_rng << 5;
+    return g_calib_rng;
+}
+
 void prox_calib_reset(void) {
     memset(g_calib_inside_hist, 0, sizeof(g_calib_inside_hist));
     memset(g_calib_edge_hist,   0, sizeof(g_calib_edge_hist));
     g_calib_inside_n = 0;
     g_calib_edge_n   = 0;
+    g_calib_buf_n[0] = g_calib_buf_n[1] = 0;
+    g_calib_offered[0] = g_calib_offered[1] = 0;
+}
+
+// Buffer one demonstrated vector. Reservoir sampling (Algorithm R) rather than
+// keeping the first or last N: during the INSIDE leg the user is roaming the
+// whole zone, so a positional bias toward either end of the walk would bias the
+// threshold. Every offered sample gets an equal chance of being retained.
+void prox_calib_collect(const ProxScanVector* v, int is_inside) {
+    if (!v || v->count == 0) return;
+    const int leg = is_inside ? 1 : 0;
+    uint32_t seen = ++g_calib_offered[leg];
+
+    int slot;
+    if (g_calib_buf_n[leg] < PROX_CALIB_BUF_SAMPLES) {
+        slot = g_calib_buf_n[leg]++;
+    } else {
+        uint32_t r = calib_rand() % seen;
+        if (r >= PROX_CALIB_BUF_SAMPLES) return;   // not retained
+        slot = (int)r;
+    }
+
+    // Keep the strongest PROX_CALIB_BUF_DEVICES; the vector arrives already
+    // ordered strongest-first from the watch's cache.
+    CalibSample* cs = &g_calib_buf[leg][slot];
+    int k = v->count < PROX_CALIB_BUF_DEVICES ? v->count : PROX_CALIB_BUF_DEVICES;
+    cs->count = (uint8_t)k;
+    for (int i = 0; i < k; ++i) cs->dev[i] = v->devices[i];
+
+    // The anchor's own beacon must survive truncation. It is now a SCORED
+    // feature (self_score_delta), and it is not especially strong — measured at
+    // -80 dBm in a real install, which in a busy room sits well outside the top
+    // 24 by RSSI. Truncating it away silently disarms the term, because the two
+    // demonstrated levels are learned from exactly these buffered vectors.
+    // Displace the weakest kept entry instead.
+    if (!g_have_self || k == 0) return;
+    for (int i = 0; i < k; ++i) {
+        if (cs->dev[i].type == PROX_TYPE_BLE &&
+            memcmp(cs->dev[i].mac, g_self_mac, 6) == 0)
+            return;                                   // already retained
+    }
+    for (int i = k; i < v->count; ++i) {
+        if (v->devices[i].type == PROX_TYPE_BLE &&
+            memcmp(v->devices[i].mac, g_self_mac, 6) == 0) {
+            cs->dev[k - 1] = v->devices[i];
+            return;
+        }
+    }
+}
+
+int prox_calib_collected(int is_inside) {
+    return (int)g_calib_offered[is_inside ? 1 : 0];
 }
 
 void prox_calib_add(int is_inside, uint8_t score) {
@@ -496,13 +763,242 @@ static uint8_t histo_percentile(const uint16_t* h, uint32_t n, int pct) {
     return 255;
 }
 
+// Mean of the anchor's own beacon level across one buffered calibration leg.
+// Returns 0 if the anchor did not appear in enough of that leg's vectors.
+static int calib_leg_self_mean(int leg, int8_t* out) {
+    if (!g_have_self) return 0;
+    int32_t sum = 0; int n = 0;
+    for (int i = 0; i < g_calib_buf_n[leg]; ++i) {
+        ProxScanVector v;
+        v.count = g_calib_buf[leg][i].count;
+        for (int d = 0; d < v.count; ++d) v.devices[d] = g_calib_buf[leg][i].dev[d];
+        int8_t s;
+        if (vec_lookup(&v, g_self_mac, PROX_TYPE_BLE, &s)) { sum += s; n++; }
+    }
+    // Demand a majority: a level learned from two stray samples is not a level.
+    if (n == 0 || n * 2 < g_calib_buf_n[leg]) return 0;
+    *out = (int8_t)(sum / n);
+    return 1;
+}
+
+// Learn the two demonstrated beacon levels from the calibration legs. Refuses
+// rather than guesses: an unlearned term abstains and the score is unchanged.
+static void calib_learn_self_levels(void) {
+    int8_t near_dbm = 0, away_dbm = 0;
+    g_self_cal_valid = 0;
+    if (!calib_leg_self_mean(1, &near_dbm)) return;
+    if (!calib_leg_self_mean(0, &away_dbm)) return;
+    // INSIDE must actually be the stronger of the two by a usable margin,
+    // otherwise level carries no information here (or the legs were demonstrated
+    // backwards) and the term stays off.
+    if ((int)near_dbm - (int)away_dbm < PROX_SELF_MIN_SPAN_DB) return;
+    g_self_near_dbm  = near_dbm;
+    g_self_away_dbm  = away_dbm;
+    g_self_cal_valid = 1;
+
+    uint8_t rec[4];
+    rec[0] = 0x53;                       // 'S', format tag
+    rec[1] = (uint8_t)near_dbm;
+    rec[2] = (uint8_t)away_dbm;
+    rec[3] = 1;
+    prox_platform_nvs_save(PROX_SELF_NVS_KEY, rec, sizeof(rec));
+}
+
+static void prox_load_self_levels(void) {
+    uint8_t rec[4]; size_t len = 0;
+    g_self_cal_valid = 0;
+    if (!prox_platform_nvs_load(PROX_SELF_NVS_KEY, rec, sizeof(rec), &len)) return;
+    if (len != sizeof(rec) || rec[0] != 0x53 || rec[3] != 1) return;
+    g_self_near_dbm = (int8_t)rec[1];
+    g_self_away_dbm = (int8_t)rec[2];
+    if ((int)g_self_near_dbm - (int)g_self_away_dbm < PROX_SELF_MIN_SPAN_DB) return;
+    g_self_cal_valid = 1;
+}
+
+// ---- calibration diagnostics -------------------------------------------------
+//
+// Everything here reads the two histograms; nothing here influences the decision.
+// The point is to distinguish "the rule refused" from "the score never separated
+// these two positions", which look identical from the app's side but have
+// completely different fixes.
+
+static ProxCalibStats g_calib_stats;
+static uint8_t        g_calib_stats_valid = 0;
+
+static inline uint8_t bucket_centre(int b) {
+    return (uint8_t)(b * PROX_CALIB_BUCKET_WIDTH + PROX_CALIB_BUCKET_WIDTH / 2);
+}
+
+static uint32_t isqrt32(uint32_t x) {
+    uint32_t r = 0, bit = 1u << 30;
+    while (bit > x) bit >>= 2;
+    while (bit) {
+        if (x >= r + bit) { x -= r + bit; r = (r >> 1) + bit; }
+        else              { r >>= 1; }
+        bit >>= 2;
+    }
+    return r;
+}
+
+// Mean and standard deviation over a bucketed histogram, in score units.
+static void histo_moments(const uint16_t* h, uint32_t n, uint8_t* mean, uint8_t* sd,
+                          uint8_t* lo, uint8_t* hi) {
+    *mean = *sd = 0;
+    *lo = 0; *hi = 0;
+    if (!n) return;
+    uint32_t sum = 0;
+    int first = -1, last = -1;
+    for (int b = 0; b < PROX_CALIB_HIST_BUCKETS; ++b) {
+        if (!h[b]) continue;
+        if (first < 0) first = b;
+        last = b;
+        sum += (uint32_t)h[b] * bucket_centre(b);
+    }
+    const uint32_t m = sum / n;
+    uint64_t ss = 0;
+    for (int b = 0; b < PROX_CALIB_HIST_BUCKETS; ++b) {
+        if (!h[b]) continue;
+        const int32_t d = (int32_t)bucket_centre(b) - (int32_t)m;
+        ss += (uint64_t)h[b] * (uint64_t)(d * d);
+    }
+    const uint32_t var = (uint32_t)(ss / n);
+    *mean = (uint8_t)(m > 255 ? 255 : m);
+    *sd   = (uint8_t)(isqrt32(var) > 255 ? 255 : isqrt32(var));
+    *lo   = bucket_centre(first < 0 ? 0 : first);
+    *hi   = bucket_centre(last  < 0 ? 0 : last);
+}
+
+// Count of samples strictly below / at-or-above a score.
+static uint32_t histo_count_below(const uint16_t* h, uint8_t s) {
+    uint32_t c = 0;
+    for (int b = 0; b < PROX_CALIB_HIST_BUCKETS; ++b)
+        if (bucket_centre(b) < s) c += h[b];
+    return c;
+}
+static uint32_t histo_count_atleast(const uint16_t* h, uint8_t s) {
+    uint32_t c = 0;
+    for (int b = 0; b < PROX_CALIB_HIST_BUCKETS; ++b)
+        if (bucket_centre(b) >= s) c += h[b];
+    return c;
+}
+
+// Error-minimising cutoff over the two demonstrated histograms. Falls back to
+// the global default only when there is genuinely nothing to measure.
+static uint8_t calib_best_threshold(void) {
+    if (!g_calib_inside_n || !g_calib_edge_n) return PROX_CONFIDENCE_THRESHOLD_U8;
+    uint32_t best_err = 0xFFFFFFFFu;
+    uint8_t  best_t   = PROX_CONFIDENCE_THRESHOLD_U8;
+    for (int b = 0; b < PROX_CALIB_HIST_BUCKETS; ++b) {
+        const uint8_t t = bucket_centre(b);
+        const uint32_t err = histo_count_below(g_calib_inside_hist, t) +
+                             histo_count_atleast(g_calib_edge_hist, t);
+        if (err < best_err) { best_err = err; best_t = t; }
+    }
+    return best_t;
+}
+
+static void calib_capture_stats(uint8_t thr, uint8_t conf, uint8_t fail) {
+    ProxCalibStats* s = &g_calib_stats;
+    memset(s, 0, sizeof(*s));
+    s->inside_n   = (uint16_t)g_calib_inside_n;
+    s->edge_n     = (uint16_t)g_calib_edge_n;
+    s->threshold  = thr;
+    s->confidence = conf;
+    s->fail       = fail;
+
+    histo_moments(g_calib_inside_hist, g_calib_inside_n,
+                  &s->inside_mean, &s->inside_sd, &s->inside_min, &s->inside_max);
+    histo_moments(g_calib_edge_hist, g_calib_edge_n,
+                  &s->edge_mean, &s->edge_sd, &s->edge_min, &s->edge_max);
+
+    if (!g_calib_inside_n || !g_calib_edge_n) { g_calib_stats_valid = 1; return; }
+
+    s->inside_p10 = histo_percentile(g_calib_inside_hist, g_calib_inside_n, 10);
+    s->edge_p90   = histo_percentile(g_calib_edge_hist,   g_calib_edge_n,   90);
+    s->gap = (int16_t)((int)s->inside_p10 -
+                       ((int)s->edge_p90 + PROX_CALIB_THRESHOLD_MARGIN_U8));
+
+    // How badly the clouds interpenetrate, in the rule's own terms.
+    s->edge_above_pct   = (uint8_t)((100u * histo_count_atleast(g_calib_edge_hist,
+                                                                s->inside_p10)) / g_calib_edge_n);
+    s->inside_below_pct = (uint8_t)((100u * histo_count_below(g_calib_inside_hist,
+                                        (uint8_t)(s->edge_p90 + 1))) / g_calib_inside_n);
+
+    // Cohen's d over the pooled SD: are these two clouds separable at all?
+    const uint32_t pooled_var =
+        ((uint32_t)s->inside_sd * s->inside_sd + (uint32_t)s->edge_sd * s->edge_sd) / 2u;
+    const uint32_t pooled_sd = isqrt32(pooled_var);
+    const int32_t  dmean     = (int32_t)s->inside_mean - (int32_t)s->edge_mean;
+    if (pooled_sd == 0) {
+        s->dprime_x10 = (uint8_t)(dmean > 0 ? 255 : 0);   // zero spread: perfectly separated
+    } else {
+        int32_t d10 = (dmean * 10) / (int32_t)pooled_sd;
+        if (d10 < 0)   d10 = 0;
+        if (d10 > 255) d10 = 255;
+        s->dprime_x10 = (uint8_t)d10;
+    }
+
+    // The best cutoff that exists, and what it would cost. This is the number
+    // that says whether the RULE was the problem.
+    const uint32_t total = g_calib_inside_n + g_calib_edge_n;
+    uint32_t best_err = 0xFFFFFFFFu;
+    uint8_t  best_t   = 0;
+    for (int b = 0; b < PROX_CALIB_HIST_BUCKETS; ++b) {
+        const uint8_t t = bucket_centre(b);
+        const uint32_t err = histo_count_below(g_calib_inside_hist, t) +
+                             histo_count_atleast(g_calib_edge_hist, t);
+        if (err < best_err) { best_err = err; best_t = t; }
+    }
+    s->best_thr     = best_t;
+    s->best_err_pct = (uint8_t)((100u * best_err) / total);
+    g_calib_stats_valid = 1;
+}
+
+int prox_calib_last_stats(ProxCalibStats* out) {
+    if (!g_calib_stats_valid || !out) return 0;
+    *out = g_calib_stats;
+    return 1;
+}
+
 uint8_t prox_calib_finalize(uint16_t* inside_n, uint16_t* edge_n, uint8_t* confidence) {
+    // Deferred path: if vectors were buffered, train once and rebuild BOTH
+    // histograms against the resulting fingerprint, so the threshold is measured
+    // on the same estimator that will be deployed. Falls back to whatever
+    // prox_calib_add() accumulated when nothing was buffered.
+    if (g_calib_buf_n[0] || g_calib_buf_n[1]) {
+        for (int i = 0; i < g_calib_buf_n[1]; ++i) {
+            ProxScanVector v;
+            v.count = g_calib_buf[1][i].count;
+            for (int d = 0; d < v.count; ++d) v.devices[d] = g_calib_buf[1][i].dev[d];
+            prox_train_labeled(&v, 1);
+        }
+        // Learn the self-RSSI levels BEFORE re-scoring, for the same reason the
+        // fingerprint is trained first: the threshold has to be measured on the
+        // exact estimator that will be deployed, not on a predecessor of it.
+        calib_learn_self_levels();
+        memset(g_calib_inside_hist, 0, sizeof(g_calib_inside_hist));
+        memset(g_calib_edge_hist,   0, sizeof(g_calib_edge_hist));
+        g_calib_inside_n = g_calib_edge_n = 0;
+        for (int leg = 0; leg < 2; ++leg) {
+            for (int i = 0; i < g_calib_buf_n[leg]; ++i) {
+                ProxScanVector v;
+                v.count = g_calib_buf[leg][i].count;
+                for (int d = 0; d < v.count; ++d) v.devices[d] = g_calib_buf[leg][i].dev[d];
+                ProxScoreResult r = prox_compute_score(&v);
+                prox_calib_add(leg == 1, r.score);
+            }
+        }
+    }
+
     uint16_t in_n = (uint16_t)g_calib_inside_n;
     uint16_t ed_n = (uint16_t)g_calib_edge_n;
     uint8_t thr, conf;
+    uint8_t fail = 0;
 
     if (g_calib_inside_n < PROX_CALIB_MIN_SAMPLES || g_calib_edge_n < PROX_CALIB_MIN_SAMPLES) {
         // Not enough demonstrated samples to trust a learned cutoff.
+        if (g_calib_inside_n < PROX_CALIB_MIN_SAMPLES) fail |= PROX_CALIB_FAIL_FEW_INSIDE;
+        if (g_calib_edge_n   < PROX_CALIB_MIN_SAMPLES) fail |= PROX_CALIB_FAIL_FEW_EDGE;
         thr  = PROX_CONFIDENCE_THRESHOLD_U8;
         conf = 0;
     } else {
@@ -517,11 +1013,25 @@ uint8_t prox_calib_finalize(uint16_t* inside_n, uint16_t* edge_n, uint8_t* confi
             int c = gap * 4; if (c > 255) c = 255; // ~64 score-units of gap → full
             conf = (uint8_t)c;
         } else {
-            // Overlap (edge scores reach into the inside scores) — bad demo.
-            thr  = PROX_CONFIDENCE_THRESHOLD_U8;
+            // Overlap: the conservative percentile rule found no gap. Fall back to
+            // the error-minimising cutoff over the two demonstrated histograms
+            // rather than to the global constant.
+            //
+            // The global PROX_CONFIDENCE_THRESHOLD_U8 assumes a score scale this
+            // anchor may not have. Measured in the field: one run's scores spanned
+            // 156..212, entirely ABOVE the 170 default, so the fallback classified
+            // essentially everything as NEAR while the best available cutoff (188)
+            // would have been wrong only 19% of the time. Confidence still reports
+            // 0 — this is a degraded threshold, not an endorsed one — but a
+            // measured degraded threshold beats an unmeasured one.
+            fail |= PROX_CALIB_FAIL_OVERLAP;
+            thr  = calib_best_threshold();
             conf = 0;
         }
     }
+
+    // Snapshot the diagnostics while the histograms still exist.
+    calib_capture_stats(thr, conf, fail);
 
     if (inside_n)   *inside_n = in_n;
     if (edge_n)     *edge_n = ed_n;
@@ -559,6 +1069,11 @@ void prox_persist_if_due(void) {
     for (int i = 0; i < g_reg_count; ++i) {
         AnchorDev* d = &g_reg[i];
         if (!d->in_use) continue;
+        // Persist only real fingerprint entries. Saving every transient meant
+        // the anchor woke up with all 128 slots occupied by addresses that had
+        // rotated days ago, and reg_add() could never admit a live device again.
+        if (d->W < PROX_MIN_FINGERPRINT_WEIGHT) continue;
+        if (mac_is_rotating(d->mac, d->type)) continue;
         memcpy(buf + off, d->mac, 6); off += 6;
         buf[off++] = d->type;
         wr_f32(buf + off, d->mu); off += 4;
@@ -585,7 +1100,8 @@ static void prox_load_from_nvs(void) {
         n = rd_u16(buf); off = 2;
     }
     g_reg_count = 0;
-    for (int i = 0; i < n && off + PROX_NVS_REC <= len; ++i) {
+    for (int i = 0; i < n && off + PROX_NVS_REC <= len
+                  && g_reg_count < ANCHOR_PROX_MAX_FINGERPRINT_DEVICES; ++i) {
         AnchorDev* d = &g_reg[g_reg_count++];
         memset(d, 0, sizeof(*d));
         memcpy(d->mac, buf + off, 6); off += 6;
@@ -633,41 +1149,162 @@ int prox_load_fingerprint(const uint8_t* blob, size_t len) {
 // ============================================================================
 #ifdef PROXIMITY_ROLE_WATCH
 
+// ── Multi-window scan cache ─────────────────────────────────────────────────
+// See the PROX_CACHE_TTL_MS commentary in proximity.h for why one scan window
+// is not one observation. Structure: each device carries the last
+// PROX_CACHE_SAMPLES per-window maxima (newest first) with fold timestamps, plus an
+// accumulator for the window currently open.
 #define PROX_SCAN_BUF 128
-typedef struct { uint8_t mac[6]; uint8_t type; int8_t rssi; uint8_t used; } ScanEntry;
+typedef struct {
+    uint8_t  mac[6];
+    uint8_t  type;
+    int8_t   win_max;                        // strongest reading in the open window
+    int8_t   rssi[PROX_CACHE_SAMPLES];       // retained per-window maxima, newest first
+    uint32_t at_ms[PROX_CACHE_SAMPLES];      // when each was folded
+    uint8_t  n;                              // valid entries in rssi/at_ms
+    uint8_t  used;
+} ScanEntry;
 static ScanEntry g_scan[PROX_SCAN_BUF];
 static int       g_scan_count = 0;
+static int       g_scan_win_open = 0;   // any result ingested into the open window?
+
+void prox_scan_cache_reset(void) {
+    g_scan_count = 0;
+    g_scan_win_open = 0;
+}
 
 void prox_ingest_scan_result(const uint8_t mac[6], uint8_t type, int8_t rssi) {
+    g_scan_win_open = 1;
     for (int i = 0; i < g_scan_count; ++i)
         if (g_scan[i].used && g_scan[i].type == type && mac_eq(g_scan[i].mac, mac)) {
-            if (rssi > g_scan[i].rssi) g_scan[i].rssi = rssi; // keep strongest
+            if (rssi > g_scan[i].win_max) g_scan[i].win_max = rssi; // strongest wins
             return;
         }
     if (g_scan_count < PROX_SCAN_BUF) {
         ScanEntry* e = &g_scan[g_scan_count++];
-        memcpy(e->mac, mac, 6); e->type = type; e->rssi = rssi; e->used = 1;
+        memcpy(e->mac, mac, 6);
+        e->type    = type;
+        e->win_max = rssi;
+        e->n       = 0;
+        e->used    = 1;
     }
 }
 
-// Select the strongest PROX_MAX_DEVICES into the output vector, then reset buffer.
+// Drop samples older than the TTL; returns how many remain.
+static int cache_age_out(ScanEntry* e, uint32_t now) {
+    int w = 0;
+    for (int i = 0; i < e->n; ++i) {
+        if ((uint32_t)(now - e->at_ms[i]) > (uint32_t)PROX_CACHE_TTL_MS) continue;
+        e->rssi[w]  = e->rssi[i];
+        e->at_ms[w] = e->at_ms[i];
+        w++;
+    }
+    e->n = (uint8_t)w;
+    return w;
+}
+
+void prox_scan_window_close(void) {
+    if (!g_scan_win_open) return;   // nothing scanned; don't age history for free
+    const uint32_t now = prox_platform_now_ms();
+
+    // While the wrist is moving, successive windows are taken at different
+    // positions, so averaging across them smears distinct fades together. The
+    // integrator restarts its window on STILL->LOCOMOTION for the same reason
+    // (§4.2); do the same here and keep only the freshest sample.
+    const int moving = (prox_motion_state() == PROX_MOTION_LOCOMOTION);
+
+    int w = 0;
+    for (int i = 0; i < g_scan_count; ++i) {
+        ScanEntry* e = &g_scan[i];
+        if (!e->used) continue;
+
+        if (moving) e->n = 0;
+        else        cache_age_out(e, now);
+
+        if (e->win_max != PROX_RSSI_ABSENT) {
+            // Push newest-first, dropping the oldest when the ring is full.
+            int keep = e->n < PROX_CACHE_SAMPLES ? e->n : PROX_CACHE_SAMPLES - 1;
+            for (int j = keep; j > 0; --j) {
+                e->rssi[j]  = e->rssi[j - 1];
+                e->at_ms[j] = e->at_ms[j - 1];
+            }
+            e->rssi[0]  = e->win_max;
+            e->at_ms[0] = now;
+            if (e->n < PROX_CACHE_SAMPLES) e->n++;
+        }
+
+        e->win_max = PROX_RSSI_ABSENT;              // open the next window
+
+        if (e->n == 0) continue;                    // nothing within the TTL: evict
+        if (w != i) g_scan[w] = *e;                 // compact in place
+        w++;
+    }
+    g_scan_count = w;
+    g_scan_win_open = 0;
+}
+
+// Median of a device's retained per-window maxima. For an even count this takes
+// the upper of the two central values: a device's misses are downward-biased
+// (a weak capture or a missed advertisement, never a spuriously strong one), so
+// leaning to the stronger side corrects rather than inflates.
+static int8_t cache_rssi(const ScanEntry* e) {
+    if (e->n == 0) return PROX_RSSI_ABSENT;
+    int8_t v[PROX_CACHE_SAMPLES];
+    int n = e->n;
+    for (int i = 0; i < n; ++i) v[i] = e->rssi[i];
+    for (int a = 1; a < n; ++a) {                     // insertion sort ascending
+        int8_t key = v[a]; int b = a - 1;
+        while (b >= 0 && v[b] > key) { v[b + 1] = v[b]; b--; }
+        v[b + 1] = key;
+    }
+    return v[n / 2];
+}
+
+int prox_scan_cache_count(void) { return g_scan_count; }
+
+int prox_scan_cache_stable_count(void) {
+    int n = 0;
+    for (int i = 0; i < g_scan_count; ++i)
+        if (g_scan[i].used && g_scan[i].n >= PROX_CACHE_SAMPLES) n++;
+    return n;
+}
+
 void prox_build_scan_vector(ProxScanVector* out) {
-    // simple selection sort of top-K by RSSI (K small, buffer small → fine)
+    if (g_scan_win_open) prox_scan_window_close();    // safety net for callers that don't
+
+    // Rank by RSSI, with persistence only as a tie-break.
+    //
+    // Ranking by persistence FIRST was tried and was wrong. The score is a
+    // correlation over devices the watch and the anchor BOTH see, so the vector's
+    // job is to maximise that intersection -- and signal strength is what makes a
+    // device mutually visible, while persistence is a purely watch-local
+    // property. Selecting the watch's most-persistent devices optimised the wrong
+    // objective and collapsed the shared set to a handful, which then drove
+    // Pearson into its degenerate small-k regime (see signal_correlation).
+    //
+    // Membership stability comes from the cache carrying devices across windows
+    // and from ranking on a *median* RSSI instead of one instantaneous draw --
+    // not from changing what the vector is selecting for.
     int n = g_scan_count;
     int k = n < PROX_MAX_DEVICES ? n : PROX_MAX_DEVICES;
+    int8_t rssi[PROX_SCAN_BUF];
+    for (int i = 0; i < n; ++i) rssi[i] = cache_rssi(&g_scan[i]);
     for (int i = 0; i < k; ++i) {
         int best = i;
-        for (int j = i + 1; j < n; ++j)
-            if (g_scan[j].rssi > g_scan[best].rssi) best = j;
+        for (int j = i + 1; j < n; ++j) {
+            if (rssi[j] > rssi[best] ||
+                (rssi[j] == rssi[best] && g_scan[j].n > g_scan[best].n))
+                best = j;
+        }
         ScanEntry tmp = g_scan[i]; g_scan[i] = g_scan[best]; g_scan[best] = tmp;
+        int8_t tr = rssi[i]; rssi[i] = rssi[best]; rssi[best] = tr;
     }
     out->count = (uint8_t)k;
     for (int i = 0; i < k; ++i) {
         memcpy(out->devices[i].mac, g_scan[i].mac, 6);
         out->devices[i].type = g_scan[i].type;
-        out->devices[i].rssi = g_scan[i].rssi;
+        out->devices[i].rssi = rssi[i];
     }
-    g_scan_count = 0;
 }
 
 // Wire format (spec §6.3.1): [1 count][per dev: 6 mac, 1 type, 1 (rssi+128)]
@@ -993,6 +1630,165 @@ static uint8_t  g_hmm_primed   = 0;
 static uint8_t  g_hmm_first    = 1;   // no emission has been folded in yet
 static uint32_t g_hmm_draw_resid_q12 = 0;  // fractional draws carried between ticks
 static int32_t  g_hmm_still_credited_q8 = 0;  // evidence already granted in this still window
+// PDR is kept in its own pending slot rather than summed into g_hmm_local_q8,
+// because the two channels have different arithmetic. Connect-failure is an
+// *event*: each one is a separate observation and they add. PDR is a *level* —
+// the current standing estimate of the LO-slot delivery rate — so a second
+// window before the next tick must replace the first, not double it.
+static int32_t  g_hmm_pdr_q8   = 0;
+
+// ---- Observation window & stepped-power PDR (§3.3) ------------------------
+//
+// The window ledger is per-cycle, not per-slot, because "covered" is defined by
+// having heard the cycle at all (see PDR_OBS_MAX_CYCLES in proximity.h). Eight
+// entries is double the ~4 cycles a 1800 ms window spans at BEACON_CYCLE_MS.
+
+typedef struct {
+    uint16_t cyc;
+    uint8_t  saw_hi;
+    uint8_t  saw_lo;
+} ObsCycle;
+
+static uint8_t  g_obs_mac[6];
+static uint8_t  g_obs_have = 0;
+static ObsCycle g_obs_cyc[PDR_OBS_MAX_CYCLES];
+static uint8_t  g_obs_n    = 0;
+
+// Motion-decayed Beta counts, Q4.
+static uint16_t g_pdr_hits_q4     = 0;
+static uint16_t g_pdr_cov_q4      = 0;
+static uint8_t  g_pdr_last_motion = PROX_MOTION_UNKNOWN;
+static uint8_t  g_pdr_primed      = 0;
+static int32_t  g_pdr_loglr_q8    = 0;
+
+void prox_pdr_reset(void) {
+    g_pdr_hits_q4 = 0;
+    g_pdr_cov_q4  = 0;
+    g_pdr_last_motion = PROX_MOTION_UNKNOWN;
+    g_pdr_primed   = 0;
+    g_pdr_loglr_q8 = 0;
+    g_hmm_pdr_q8   = 0;
+    g_obs_have = 0;
+    g_obs_n    = 0;
+}
+
+void prox_obs_begin(const uint8_t anchor_mac[6]) {
+    g_obs_n = 0;
+    if (anchor_mac) {
+        memcpy(g_obs_mac, anchor_mac, 6);
+        g_obs_have = 1;
+    } else {
+        g_obs_have = 0;
+    }
+}
+
+void prox_obs_note(const uint8_t mac[6], uint16_t minor, int8_t rssi) {
+    (void)rssi;                                   // PDR is presence, not amplitude
+    if (!g_obs_have || !mac) return;
+    if (memcmp(mac, g_obs_mac, 6) != 0) return;   // some other anchor's beacon
+
+    uint8_t  slot = 0;
+    uint16_t cyc  = 0;
+    // A legacy (BEACON_SCHEDULE_ENABLE = 0) anchor sends Minor 0x0000, which the
+    // shipped decoder rejects. Such an anchor simply yields no PDR evidence.
+    if (!prox_beacon_minor_decode(minor, &slot, &cyc)) return;
+
+    ObsCycle* e = NULL;
+    for (uint8_t i = 0; i < g_obs_n; ++i) {
+        if (g_obs_cyc[i].cyc == cyc) { e = &g_obs_cyc[i]; break; }
+    }
+    if (!e) {
+        if (g_obs_n >= PDR_OBS_MAX_CYCLES) return;   // window ran longer than planned
+        e = &g_obs_cyc[g_obs_n++];
+        e->cyc = cyc; e->saw_hi = 0; e->saw_lo = 0;
+    }
+    if (prox_beacon_slot_is_lo(slot)) e->saw_lo = 1;
+    else                              e->saw_hi = 1;
+}
+
+static void pdr_accumulate(uint8_t hits, uint8_t covered) {
+    const uint8_t ms = prox_motion_state();
+
+    // STILL -> moving is a window restart (§4.2): the wrist may be somewhere
+    // else now, and slot evidence gathered at the old position must not outvote
+    // what the new position is about to say.
+    if (g_pdr_primed && g_pdr_last_motion == PROX_MOTION_STILL &&
+        ms != PROX_MOTION_STILL) {
+        g_pdr_hits_q4 = 0;
+        g_pdr_cov_q4  = 0;
+    }
+    g_pdr_last_motion = ms;
+    g_pdr_primed      = 1;
+
+    // A motionless wrist re-measures one frozen fade. It earns a fraction of a
+    // slot, not a whole one — the same INTEG_STILL_WEIGHT discount every other
+    // integrated quantity gets, and for the identical reason.
+    const uint32_t w_q8 = (ms == PROX_MOTION_STILL) ? (uint32_t)INTEG_STILL_WEIGHT : 256u;
+    g_pdr_hits_q4 = (uint16_t)(g_pdr_hits_q4 + ((((uint32_t)hits    << 4) * w_q8) >> 8));
+    g_pdr_cov_q4  = (uint16_t)(g_pdr_cov_q4  + ((((uint32_t)covered << 4) * w_q8) >> 8));
+
+    // Ceiling. Both counts are rescaled together, so capping costs confidence
+    // but never shifts the estimated rate.
+    const uint16_t cap_q4 = (uint16_t)(PDR_MAX_EFF_SLOTS << 4);
+    if (g_pdr_cov_q4 > cap_q4) {
+        g_pdr_hits_q4 = (uint16_t)(((uint32_t)g_pdr_hits_q4 * cap_q4) / g_pdr_cov_q4);
+        g_pdr_cov_q4  = cap_q4;
+    }
+}
+
+// Naive-Bayes sum over the decayed slot counts, then clamped asymmetrically.
+// See LL_PDR_NEAR_MAX_Q8 / LL_PDR_AWAY_MAX_Q8: the asymmetry is the §13.0
+// anti-tamper invariant, not a tuning knob.
+static int32_t pdr_loglr_q8(void) {
+    if (g_pdr_cov_q4 < (uint16_t)(PDR_MIN_COVERED << 4)) return 0;
+    const int32_t miss_q4 = (int32_t)g_pdr_cov_q4 - (int32_t)g_pdr_hits_q4;
+    int32_t ll = (((int32_t)g_pdr_hits_q4 * LL_PDR_HIT_Q8) +
+                  (miss_q4 * LL_PDR_MISS_Q8)) >> 4;
+    if (ll > LL_PDR_NEAR_MAX_Q8) ll = LL_PDR_NEAR_MAX_Q8;
+    if (ll < LL_PDR_AWAY_MAX_Q8) ll = LL_PDR_AWAY_MAX_Q8;
+    return ll;
+}
+
+int prox_obs_close(uint8_t* out_hits, uint8_t* out_covered) {
+    uint8_t covered = 0, hits = 0;
+    for (uint8_t i = 0; i < g_obs_n; ++i) {
+        // Hearing either slot proves the cycle happened AND that the window
+        // spanned it. A cycle the window merely clipped is heard in neither slot
+        // and contributes to neither count.
+        if (!g_obs_cyc[i].saw_hi && !g_obs_cyc[i].saw_lo) continue;
+        covered++;
+        if (g_obs_cyc[i].saw_lo) hits++;
+    }
+    g_obs_n = 0;
+
+    if (out_hits)    *out_hits    = hits;
+    if (out_covered) *out_covered = covered;
+
+    // Too little of the schedule was heard to say anything. Abstain rather than
+    // report 0/1 as a miss — that is how a merely-unlucky scan turns into
+    // fabricated AWAY evidence.
+    if (covered < PDR_MIN_COVERED) {
+        g_pdr_loglr_q8 = 0;
+        g_hmm_pdr_q8   = 0;
+        return 0;
+    }
+
+    pdr_accumulate(hits, covered);
+    g_pdr_loglr_q8 = pdr_loglr_q8();
+    g_hmm_pdr_q8   = g_pdr_loglr_q8;
+    return g_pdr_loglr_q8 != 0;
+}
+
+int prox_pdr_state(uint8_t* out_rate_u8, uint8_t* out_covered, int32_t* out_loglr_q8) {
+    if (out_rate_u8) {
+        *out_rate_u8 = g_pdr_cov_q4
+            ? (uint8_t)(((uint32_t)g_pdr_hits_q4 * 255u) / g_pdr_cov_q4)
+            : 0u;
+    }
+    if (out_covered)   *out_covered   = (uint8_t)(g_pdr_cov_q4 >> 4);
+    if (out_loglr_q8)  *out_loglr_q8  = g_pdr_loglr_q8;
+    return g_pdr_cov_q4 >= (uint16_t)(PDR_MIN_COVERED << 4);
+}
 
 // One transition step for a flip probability expressed in ppm.
 static int32_t hmm_transition(int32_t lam_q8, uint32_t pflip_ppm) {
@@ -1041,6 +1837,7 @@ void prox_hmm_reset(uint8_t criterion) {
     g_hmm_first    = 1;
     g_hmm_draw_resid_q12 = 0;
     g_hmm_still_credited_q8 = 0;
+    prox_pdr_reset();                    // slot counts are per-enforcement-window
     motion_reset();                      // motion state UNKNOWN until the first burst
 }
 
@@ -1099,8 +1896,12 @@ static ProxDecision hmm_fold(int32_t raw_loglr_q8, uint8_t cap_neff) {
     // frozen-fade failure exactly, arriving through a different channel. A
     // re-failed connect with nothing moved is no more independent than a
     // re-measured fade, so it earns evidence on the same terms.
-    int32_t total = raw_loglr_q8 + g_hmm_local_q8;
+    int32_t total = raw_loglr_q8 + g_hmm_local_q8 + g_hmm_pdr_q8;
     g_hmm_local_q8 = 0;
+    // PDR is consumed, not zeroed-and-forgotten: the level is re-queued by the
+    // next prox_obs_close(). A tick with no observation window therefore folds no
+    // PDR evidence rather than repeating the last window's.
+    g_hmm_pdr_q8   = 0;
 
     // A zero total is a no-information observation (a failed query with no
     // advertisement to judge it by, or a score sitting exactly on the anchor's
@@ -1439,6 +2240,7 @@ void prox_init(void) {
     g_near_threshold = 0;
     prox_calib_reset();
     prox_load_from_nvs();
+    prox_load_self_levels();
 #endif
 #ifdef PROXIMITY_ROLE_WATCH
     g_scan_count = 0;

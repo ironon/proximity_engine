@@ -785,7 +785,493 @@ static void test_beacon_minor(void) {
 #endif
 }
 
+
+// ---------------------------------------------------------------- scan cache
+
+// Build a distinct MAC from an index so tests can talk about "device i".
+static void mk_mac(int i, uint8_t out[6]) {
+    out[0] = 0xAA; out[1] = 0xBB; out[2] = 0xCC;
+    out[3] = 0x00; out[4] = (uint8_t)(i >> 8); out[5] = (uint8_t)(i & 0xFF);
+}
+
+static int vec_find(const ProxScanVector* v, int idx, int8_t* out_rssi) {
+    uint8_t mac[6]; mk_mac(idx, mac);
+    for (int i = 0; i < v->count; ++i)
+        if (memcmp(v->devices[i].mac, mac, 6) == 0) {
+            if (out_rssi) *out_rssi = v->devices[i].rssi;
+            return 1;
+        }
+    return 0;
+}
+
+static void ingest(int idx, int8_t rssi) {
+    uint8_t mac[6]; mk_mac(idx, mac);
+    prox_ingest_scan_result(mac, PROX_TYPE_BLE, rssi);
+}
+
+// The firmware samples one IMU burst per observation window (§5.4.5), so the
+// tests do too -- the cache consults motion state when it folds a window.
+// One observation window: an IMU burst (the cache consults motion state when it
+// folds) plus enough wall-clock advance that windows are distinguishable — the
+// cache ages samples by time now, not by window count.
+static void close_window_still(void) {
+    feed_still();
+    prox_scan_window_close();
+    advance_ms(2000);
+}
+
+static void test_scan_cache(void) {
+    // The whole point of the cache: one scan window is a random subset of the
+    // BLE population, so a vector built from one window is a random draw. Field
+    // data (still watch, still anchor) showed device counts of 21-31 and scores
+    // of 26-159 with a physically frozen channel.
+
+    begin("scan cache: within one window the strongest reading wins");
+    // An anchor running the beacon schedule alternates TX_HI (+9) and TX_LO
+    // (-21) inside a single window -- 30 dB apart. Averaging those two would
+    // invent a reading that was never received; the max picks the TX_HI slot.
+    prox_scan_cache_reset();
+    ingest(1, -97);   // TX_LO advert
+    ingest(1, -67);   // TX_HI advert, same window
+    ingest(1, -95);
+    close_window_still();
+    ProxScanVector v; prox_build_scan_vector(&v);
+    int8_t r = 0;
+    CHECK(vec_find(&v, 1, &r) && r == -67, "expected -67 from the TX_HI slot, got %d", (int)r);
+
+    begin("scan cache: median across windows rejects a single bad window");
+    prox_scan_cache_reset();
+    const int8_t seq[5] = { -70, -70, -95, -70, -70 };   // one deep-fade window
+    for (int w = 0; w < 5; ++w) { ingest(2, seq[w]); close_window_still(); }
+    prox_build_scan_vector(&v);
+    CHECK(vec_find(&v, 2, &r) && r == -70,
+          "median must ignore the -95 outlier (a mean would give -76), got %d", (int)r);
+
+    begin("scan cache: a device missed in some windows stays in the vector");
+    // This is the headline fix. A 2 s advertiser is caught by a 700 ms window
+    // ~35% of the time; under the old one-shot buffer it vanished from the
+    // vector on ~2 of every 3 queries, changing the correlation's device set
+    // underneath it. Seen once in four windows is enough to be carried.
+    prox_scan_cache_reset();
+    ingest(3, -80);                       // seen in window 0 only
+    for (int w = 0; w < 4; ++w) {
+        ingest(99, -60);                  // a persistent device keeps windows non-empty
+        close_window_still();
+    }
+    prox_build_scan_vector(&v);
+    CHECK(vec_find(&v, 3, &r), "a device seen in 1 of the last 4 windows must survive");
+
+    begin("scan cache: a device is evicted once its samples pass the TTL");
+    prox_scan_cache_reset();
+    ingest(4, -80);
+    close_window_still();
+    // Age past PROX_CACHE_TTL_MS while another device keeps windows non-empty.
+    for (uint32_t t = 0; t < (uint32_t)PROX_CACHE_TTL_MS + 4000; t += 2000) {
+        ingest(99, -60);
+        close_window_still();
+    }
+    prox_build_scan_vector(&v);
+    CHECK(!vec_find(&v, 4, NULL), "device unheard for > %d ms should be gone",
+          PROX_CACHE_TTL_MS);
+
+    begin("scan cache: coverage is set by TTL, not by query cadence");
+    // The regression this replaced: holding one GATT link open made queries ~5x
+    // faster, and a window-COUNT cache then spanned 5x less wall time, so vectors
+    // collapsed from ~30 devices to 8-13. Fast and slow cadences must now retain
+    // the same device.
+    for (int fast = 0; fast < 2; ++fast) {
+        prox_scan_cache_reset();
+        const uint32_t step = fast ? 500 : 8000;   // 0.5 s vs 8 s between queries
+        ingest(5, -75);
+        feed_still(); prox_scan_window_close(); advance_ms(step);
+        for (uint32_t t = step; t < 20000; t += step) {
+            ingest(98, -60);
+            feed_still(); prox_scan_window_close(); advance_ms(step);
+        }
+        prox_build_scan_vector(&v);
+        CHECK(vec_find(&v, 5, NULL),
+              "%s cadence: a device heard 20 s ago is inside the %d ms TTL",
+              fast ? "fast" : "slow", PROX_CACHE_TTL_MS);
+    }
+
+    begin("scan cache: membership is stable across queries with flaky advertisers");
+    // 40 devices, each independently caught with ~40% probability per window --
+    // the measured regime. Measure the device-set overlap between consecutive
+    // queries BOTH ways: once through the cache, and once using single-window
+    // membership (the old one-shot buffer's behaviour) over the same draws.
+    // Overlap is what the correlation actually depends on: every device that
+    // enters or leaves changes the statistic underneath it.
+    unsigned rng = 12345u;
+    int one_shot_a[40], one_shot_b[40];
+    ProxScanVector a, b;
+    prox_scan_cache_reset();
+    for (int w = 0; w < 8; ++w) {                     // prime the history
+        for (int d = 0; d < 40; ++d) {
+            rng = rng * 1103515245u + 12345u;
+            if (((rng >> 16) % 100u) < 40u) ingest(d, (int8_t)(-60 - d));
+        }
+        close_window_still();
+    }
+    for (int d = 0; d < 40; ++d) {                    // window A
+        rng = rng * 1103515245u + 12345u;
+        one_shot_a[d] = (((rng >> 16) % 100u) < 40u);
+        if (one_shot_a[d]) ingest(d, (int8_t)(-60 - d));
+    }
+    close_window_still();
+    prox_build_scan_vector(&a);
+    for (int d = 0; d < 40; ++d) {                    // window B
+        rng = rng * 1103515245u + 12345u;
+        one_shot_b[d] = (((rng >> 16) % 100u) < 40u);
+        if (one_shot_b[d]) ingest(d, (int8_t)(-60 - d));
+    }
+    close_window_still();
+    prox_build_scan_vector(&b);
+
+    int same = 0, total = 0, os_same = 0, os_total = 0;
+    for (int d = 0; d < 40; ++d) {
+        int in_a = vec_find(&a, d, NULL), in_b = vec_find(&b, d, NULL);
+        if (in_a || in_b) { total++; if (in_a && in_b) same++; }
+        if (one_shot_a[d] || one_shot_b[d]) { os_total++; if (one_shot_a[d] && one_shot_b[d]) os_same++; }
+    }
+    int pct    = total    ? (same * 100 / total)       : 0;
+    int os_pct = os_total ? (os_same * 100 / os_total) : 0;
+    printf("    membership overlap: cache %d%% vs one-shot %d%%\n", pct, os_pct);
+    CHECK(pct >= 80, "cache overlap should be >=80%%, got %d%% (%d/%d)", pct, same, total);
+    CHECK(pct >= os_pct * 2,
+          "cache should at least double one-shot overlap: %d%% vs %d%%", pct, os_pct);
+
+    begin("scan cache: scarce vector slots go to the STRONGEST devices");
+    // Selection must optimise mutual visibility, not watch-local persistence.
+    // The score is a correlation over devices the watch and anchor BOTH see, and
+    // signal strength is what makes a device mutually visible. Ranking by hit
+    // count instead was tried on hardware: it collapsed the shared set and drove
+    // Pearson into its degenerate small-k regime (scores of exactly 0 or 255).
+    prox_scan_cache_reset();
+    for (int w = 0; w < 4; ++w) {
+        for (int d = 0; d < PROX_MAX_DEVICES; ++d) ingest(d, -90);  // weak, always present
+        close_window_still();
+    }
+    for (int d = 0; d < 20; ++d) ingest(500 + d, -40);              // loud, seen once
+    close_window_still();
+    prox_build_scan_vector(&v);
+    int loud = 0;
+    for (int d = 0; d < 20; ++d) if (vec_find(&v, 500 + d, NULL)) loud++;
+    CHECK(loud == 20, "all 20 strong devices must make the vector, got %d", loud);
+
+    begin("scan cache: persistence breaks ties at equal strength");
+    // The MTU caps the vector at ~31 devices. A device present in every window
+    // is a usable correlation coordinate; one glimpsed once is a coordinate
+    // that will be absent next query.
+    prox_scan_cache_reset();
+    for (int w = 0; w < 4; ++w) {
+        for (int d = 0; d < PROX_MAX_DEVICES; ++d) ingest(d, -90);   // weak but always there
+        close_window_still();
+    }
+    for (int d = 0; d < 20; ++d) ingest(500 + d, -40);               // loud, seen once
+    close_window_still();
+    prox_scan_cache_reset();
+    for (int w = 0; w < 4; ++w) {
+        for (int d = 0; d < PROX_MAX_DEVICES; ++d) ingest(d, -70);   // equal RSSI, always seen
+        close_window_still();
+    }
+    for (int d = 0; d < 20; ++d) ingest(700 + d, -70);               // equal RSSI, seen once
+    close_window_still();
+    prox_build_scan_vector(&v);
+    int stable = 0;
+    for (int d = 0; d < PROX_MAX_DEVICES; ++d) if (vec_find(&v, d, NULL)) stable++;
+    CHECK(v.count == PROX_MAX_DEVICES, "vector should be full, got %d", (int)v.count);
+    CHECK(stable == PROX_MAX_DEVICES,
+          "at equal RSSI the persistent devices win the slots, got %d of %d",
+          stable, PROX_MAX_DEVICES);
+
+    begin("scan cache: LOCOMOTION collapses history instead of smearing positions");
+    // Averaging across windows is only valid while the windows describe the
+    // same place. Moving windows must not blend, exactly as the integrator
+    // restarts on STILL->LOCOMOTION.
+    prox_scan_cache_reset();
+    for (int w = 0; w < 3; ++w) { ingest(7, -50); close_window_still(); }
+    ingest(7, -90);
+    feed_loco();
+    prox_scan_window_close();
+    prox_build_scan_vector(&v);
+    CHECK(vec_find(&v, 7, &r) && r == -90,
+          "while moving, the freshest window alone should be reported, got %d", (int)r);
+
+    begin("scan cache: reset drops everything");
+    prox_scan_cache_reset();
+    CHECK(prox_scan_cache_count() == 0, "cache should be empty after reset");
+    prox_build_scan_vector(&v);
+    CHECK(v.count == 0, "vector from an empty cache should be empty");
+}
+
 // ----------------------------------------------------------------------------
+
+// ---------------------------------------------------------------- PDR (§3.3)
+
+static const uint8_t PDR_MAC[6]   = {0xAA, 0xBB, 0xCC, 0x11, 0x22, 0x33};
+static const uint8_t OTHER_MAC[6] = {0xAA, 0xBB, 0xCC, 0x11, 0x22, 0x99};
+
+// Feed one observation window. hi[i]/lo[i] say whether that cycle's HI and LO
+// slot was heard; cyc0 must be >= 1 because Minor 0x0000 is the reserved legacy
+// value. Returns prox_obs_close()'s verdict.
+static int feed_window(uint16_t cyc0, int n, const int* hi, const int* lo,
+                       uint8_t* hits, uint8_t* covered) {
+    prox_obs_begin(PDR_MAC);
+    for (int i = 0; i < n; ++i) {
+        uint16_t c = (uint16_t)(cyc0 + i);
+        if (hi[i]) prox_obs_note(PDR_MAC, prox_beacon_minor_encode(0, c), -70);
+        if (lo[i]) prox_obs_note(PDR_MAC, prox_beacon_minor_encode(3, c), -95);
+    }
+    return prox_obs_close(hits, covered);
+}
+
+static int32_t window_loglr(uint16_t cyc0, int n, const int* hi, const int* lo) {
+    uint8_t h = 0, c = 0;
+    feed_window(cyc0, n, hi, lo, &h, &c);
+    int32_t ll = 0;
+    prox_pdr_state(NULL, NULL, &ll);
+    return ll;
+}
+
+static void test_pdr_window(void) {
+    begin("PDR window: 'covered' means the cycle was heard, in either slot");
+
+    const int all[4]  = {1, 1, 1, 1};
+    const int none[4] = {0, 0, 0, 0};
+    uint8_t h, c;
+
+    prox_pdr_reset();
+    feed_window(10, 4, all, all, &h, &c);
+    CHECK(h == 4 && c == 4, "4 cycles heard in both slots = 4 hits of 4 covered, got %u/%u", h, c);
+
+    prox_pdr_reset();
+    feed_window(10, 4, all, none, &h, &c);
+    CHECK(h == 0 && c == 4, "HI heard, LO silent = 0 hits of 4 covered, got %u/%u", h, c);
+
+    // The LO slot alone still proves the cycle happened.
+    prox_pdr_reset();
+    feed_window(10, 4, none, all, &h, &c);
+    CHECK(h == 4 && c == 4, "LO alone is both a hit and its own denominator, got %u/%u", h, c);
+
+    // A cycle heard in neither slot is a clipped window edge, not a miss. This is
+    // the distinction that stops an unlucky scan becoming AWAY evidence.
+    const int half[4] = {1, 1, 0, 0};
+    prox_pdr_reset();
+    feed_window(10, 4, half, none, &h, &c);
+    CHECK(c == 2, "cycles heard in neither slot must not be counted, covered=%u", c);
+
+    begin("PDR window: foreign MACs and legacy Minors contribute nothing");
+    prox_pdr_reset();
+    prox_obs_begin(PDR_MAC);
+    for (int i = 0; i < 4; ++i) {
+        prox_obs_note(OTHER_MAC, prox_beacon_minor_encode(0, (uint16_t)(10 + i)), -70);
+        prox_obs_note(OTHER_MAC, prox_beacon_minor_encode(3, (uint16_t)(10 + i)), -95);
+        prox_obs_note(PDR_MAC, 0x0000, -70);          // legacy, unscheduled anchor
+    }
+    CHECK(prox_obs_close(&h, &c) == 0 && c == 0,
+          "another anchor's beacons and legacy Minors must not register, got %u/%u", h, c);
+
+    begin("PDR abstains below PDR_MIN_COVERED rather than reporting a miss");
+    const int one[1] = {1};
+    const int zero[1] = {0};
+    prox_pdr_reset();
+    CHECK(feed_window(10, 1, one, zero, &h, &c) == 0,
+          "a single covered cycle is not enough to claim anything (covered=%u)", c);
+    int32_t ll = 0;
+    prox_pdr_state(NULL, NULL, &ll);
+    CHECK(ll == 0, "an abstaining window must queue no evidence, queued %d", (int)ll);
+}
+
+static void test_pdr_schedule_disabled(void) {
+    // The safety property that lets PDR ship dark. With BEACON_SCHEDULE_ENABLE=0
+    // the anchor still stamps a Minor — prox_beacon_schedule_init() returns before
+    // beacon_emit(), so start_ble_advertising() sends encode(slot 0, cycle 1) = 1,
+    // NOT the all-zero legacy value the spec's §3.2 note assumes. It therefore
+    // decodes successfully, and every advertisement in the window lands in the
+    // same cycle. One cycle is below PDR_MIN_COVERED, so the channel abstains and
+    // contributes exactly nothing to the posterior.
+    begin("PDR: a schedule-disabled anchor yields no evidence (ships dark)");
+
+    prox_hmm_reset(PROX_CRIT_STAY_NEAR);
+    feed_loco();
+    advance_ms(1000);
+
+    const uint16_t legacy_minor = prox_beacon_minor_encode(0, 1);
+    CHECK(legacy_minor == 1, "a schedule-disabled anchor should stamp Minor 1, got %u",
+          (unsigned)legacy_minor);
+
+    prox_obs_begin(PDR_MAC);
+    for (int i = 0; i < 40; ++i) prox_obs_note(PDR_MAC, legacy_minor, -70);
+    uint8_t h = 0, c = 0;
+    CHECK(prox_obs_close(&h, &c) == 0,
+          "40 beacons all in one cycle must abstain, not score (%u/%u)", h, c);
+    CHECK(c == 1, "all beacons share one cycle, so covered must be 1, got %u", c);
+
+    int32_t ll = 0;
+    prox_pdr_state(NULL, NULL, &ll);
+    CHECK(ll == 0, "a dark schedule must queue zero evidence, queued %d", (int)ll);
+
+    // Paired comparison, because a bare tick still advances the transition model
+    // and decays the posterior on its own: run the identical tick sequence with
+    // and without dark windows and require the two to be indistinguishable.
+    int32_t with_windows, without_windows;
+    for (int pass = 0; pass < 2; ++pass) {
+        prox_hmm_reset(PROX_CRIT_STAY_NEAR);
+        for (int i = 0; i < 20; ++i) {
+            advance_ms(60000);
+            feed_loco();
+            if (pass == 0) {
+                prox_obs_begin(PDR_MAC);
+                for (int j = 0; j < 40; ++j) prox_obs_note(PDR_MAC, legacy_minor, -70);
+                prox_obs_close(&h, &c);
+            }
+            prox_hmm_tick(NULL);
+        }
+        (pass == 0 ? with_windows : without_windows) = prox_hmm_logodds_q8();
+    }
+    CHECK(with_windows == without_windows,
+          "20 dark windows must leave the posterior exactly where no windows would "
+          "(%d vs %d)", (int)with_windows, (int)without_windows);
+}
+
+static void test_pdr_loglr(void) {
+    begin("PDR log-LR: monotone in hit rate, capped asymmetrically");
+
+    const int all[4] = {1, 1, 1, 1};
+    int lo[4];
+
+    // Moving wrist: full-weight slots, so 4 cycles is enough to hit both caps.
+    int32_t prev = 0;
+    for (int hits = 4; hits >= 0; --hits) {
+        prox_hmm_reset(PROX_CRIT_STAY_NEAR);
+        feed_loco();
+        advance_ms(1000);
+        for (int i = 0; i < 4; ++i) lo[i] = (i < hits) ? 1 : 0;
+        int32_t ll = window_loglr(10, 4, all, lo);
+        if (hits < 4) {
+            CHECK(ll <= prev, "log-LR must not rise as hits fall (%d hits -> %d, was %d)",
+                  hits, (int)ll, (int)prev);
+        }
+        prev = ll;
+    }
+
+    prox_hmm_reset(PROX_CRIT_STAY_NEAR);
+    feed_loco();
+    advance_ms(1000);
+    int32_t full = window_loglr(10, 4, all, all);
+    CHECK(full == LL_PDR_NEAR_MAX_Q8,
+          "four delivered LO slots should saturate the NEAR cap %d, got %d",
+          LL_PDR_NEAR_MAX_Q8, (int)full);
+
+    const int none[4] = {0, 0, 0, 0};
+    prox_hmm_reset(PROX_CRIT_STAY_NEAR);
+    feed_loco();
+    advance_ms(1000);
+    int32_t empty = window_loglr(10, 4, all, none);
+    CHECK(empty == LL_PDR_AWAY_MAX_Q8,
+          "four lost LO slots should saturate the AWAY cap %d, got %d",
+          LL_PDR_AWAY_MAX_Q8, (int)empty);
+
+    // The asymmetry is the §13.0 invariant, so assert it as such rather than
+    // trusting two constants to stay in the right relation to each other.
+    CHECK(-empty < full,
+          "attenuation must not buy as much AWAY as delivery buys NEAR (%d vs %d)",
+          (int)-empty, (int)full);
+
+    begin("PDR: the accumulator cap preserves the estimated rate");
+    prox_pdr_reset();
+    const int alt[4] = {1, 0, 1, 0};
+    for (int w = 0; w < 20; ++w) {                 // far more than PDR_MAX_EFF_SLOTS
+        feed_loco();
+        advance_ms(1000);
+        uint8_t hh, cc;
+        feed_window((uint16_t)(10 + 4 * w), 4, all, alt, &hh, &cc);
+    }
+    uint8_t rate = 0, cov = 0;
+    prox_pdr_state(&rate, &cov, NULL);
+    CHECK(cov <= PDR_MAX_EFF_SLOTS,
+          "covered count must stay bounded, got %u (cap %d)", cov, PDR_MAX_EFF_SLOTS);
+    CHECK(rate > 100 && rate < 155,
+          "a steady 50%% delivery rate must survive capping, read %u/255", rate);
+}
+
+static void test_pdr_tamper(void) {
+    // The product constraint this whole feature is checked against: a user who
+    // smothers the watch in bedding must not be able to manufacture AWAY. PDR is
+    // the feature most exposed to that, because lost LO slots are exactly what
+    // both occlusion and distance produce.
+    begin("PDR: sustained total LO loss cannot drive the posterior to AWAY alone");
+
+    const int all[4]  = {1, 1, 1, 1};
+    const int none[4] = {0, 0, 0, 0};
+
+    prox_hmm_reset(PROX_CRIT_STAY_NEAR);
+    feed_still();
+    advance_ms(60000);
+    int32_t start = prox_hmm_logodds_q8();
+
+    for (int i = 0; i < 200; ++i) {               // 200 polls, wrist never moves
+        advance_ms(60000);
+        prox_note_sleep_interval(60000, 0);
+        feed_still();
+        uint8_t h, c;
+        feed_window((uint16_t)(10 + 4 * i), 4, all, none, &h, &c);
+        prox_hmm_tick(NULL);
+    }
+    int32_t after = prox_hmm_logodds_q8();
+
+    CHECK(after > -HMM_LAMBDA_MAX_Q8 / 2,
+          "200 identical occluded windows saturated the posterior (lam=%d)", (int)after);
+    CHECK(after < start,
+          "total LO loss should still count for something (%d -> %d)", (int)start, (int)after);
+
+    // And the same evidence arriving while the wrist is genuinely moving is
+    // allowed to be much stronger, because those are independent draws.
+    prox_hmm_reset(PROX_CRIT_STAY_NEAR);
+    feed_loco();
+    advance_ms(60000);
+    for (int i = 0; i < 10; ++i) {
+        advance_ms(60000);
+        feed_loco();
+        uint8_t h, c;
+        feed_window((uint16_t)(10 + 4 * i), 4, all, none, &h, &c);
+        prox_hmm_tick(NULL);
+    }
+    int32_t moving = prox_hmm_logodds_q8();
+    CHECK(moving < after,
+          "10 moving windows must outweigh 200 frozen ones (moving=%d frozen=%d)",
+          (int)moving, (int)after);
+    printf("    frozen 200 windows: lam=%d | moving 10 windows: lam=%d\n",
+           (int)after, (int)moving);
+
+    begin("PDR: a still wrist that starts moving discards its old slot counts");
+    prox_pdr_reset();
+    feed_still();
+    advance_ms(1000);
+    uint8_t h, c;
+    for (int i = 0; i < 6; ++i) {                 // build up a NEAR-ish history
+        feed_still();
+        advance_ms(1000);
+        feed_window((uint16_t)(10 + 4 * i), 4, all, all, &h, &c);
+    }
+    uint8_t cov_before = 0;
+    prox_pdr_state(NULL, &cov_before, NULL);
+
+    feed_loco();                                  // wrist starts walking
+    advance_ms(1000);
+    feed_window(200, 4, all, all, &h, &c);
+    uint8_t cov_after = 0;
+    prox_pdr_state(NULL, &cov_after, NULL);
+
+    // The two weights differ by 10x, so raw magnitudes are not comparable: six
+    // STILL windows bank 2.25 slots, and one moving window is worth 4 outright.
+    // The invariant is that nothing of the still history survives the restart,
+    // so the count must be exactly the new window's 4 — it would read 6 if the
+    // old 2.25 had been carried across.
+    CHECK(cov_after == 4,
+          "STILL -> moving must restart the window (had %u slots, expected exactly "
+          "the fresh 4, got %u)", cov_before, cov_after);
+}
 
 int main(void) {
     printf("proximity engine v2.1 — Phase 1 acceptance tests\n\n");
@@ -806,6 +1292,11 @@ int main(void) {
     test_ambiguous_band_abstains();
     test_field_traces();
     test_beacon_minor();
+    test_scan_cache();
+    test_pdr_window();
+    test_pdr_schedule_disabled();
+    test_pdr_loglr();
+    test_pdr_tamper();
 
     printf("\n%d checks, %d failures\n", g_checks, g_fail);
     return g_fail ? 1 : 0;

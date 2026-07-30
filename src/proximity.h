@@ -165,7 +165,36 @@
 #define BEACON_SCHEDULE_ENABLE               1
 #define BEACON_SLOT_MS                       250      // S2 fallback: 500
 #define BEACON_ADV_INTERVAL_MS               50
-#define BEACON_TX_LO_DBM                     (-21)    // placeholder until S1a measures it
+// Spike S1a (tests/prox_v2_spikes.md + spike_s1a_txlo.md). MUST be a multiple of
+// 3: NimBLE maps dBm -> esp_power_level_t as dbm/3 and rounds toward HIGHER
+// power, so -22 silently transmits at -21. -24 is the hard floor (-27 is rejected
+// outright); +9 is the top of the ladder the anchor uses.
+//
+// The spec's -21 placeholder was measured to be unusable — at 90 dB of path loss
+// it delivered 0% PDR everywhere INCLUDING inside the near-zone, i.e. a permanent
+// false AWAY. Choose per install from the reference slot's RSSI:
+//     BEACON_TX_LO_DBM ~= -91 - RSSI_HI_at_EDGE, rounded DOWN to a multiple of 3
+// which needs >= ~6 dB of RSSI separation between the two positions to work.
+//
+// -6 dBm is MEASURED, not inferred: a full 12-level sweep at both positions of a
+// real install (2026-07-30, spike_s1a_txlo.md "result 2 part 2") put it at
+// 97% slot-hit INSIDE and 0% at EDGE, meeting the >=90/<=30 pass criterion.
+//
+// It is chosen to centre the level on the point where PDR's evidence CHANGES
+// SIGN, which matters more than the pass criterion itself. With hits worth
+// LL_PDR_HIT_Q8 and misses LL_PDR_MISS_Q8, the log-LR passes through zero at a
+// hit rate of 385/917 = 42%, which that install reached at about -101 dBm
+// received. Centring on it:
+//     BEACON_TX_LO_DBM = -101 + (PL_inside + PL_edge)/2
+//                      = -92 - (RSSI_HI_inside + RSSI_HI_edge)/2
+// giving -92 - (-80 + -92)/2 = -6. That leaves +6 dB of margin at INSIDE and
+// -6 dB at EDGE, symmetric, which is what survives the +/-3 dB of RSSI wander
+// both positions actually showed. -3 dBm also passes the raw criterion but sits
+// only 3 dB from the crossover at EDGE, and flips sign there under a 3 dB gain.
+//
+// Feasibility gate: RSSI_HI_inside - RSSI_HI_edge >= ~7 dB (>=10 dB for comfort).
+// That install measured 12 dB.
+#define BEACON_TX_LO_DBM                     (-6)
 #define BEACON_SCHEDULE_EPOCH_OFFSET_MS      750      // Mode C anchor-pair phase offset
 #define BEACON_CYCLE_MS                      (BEACON_SLOT_MS * BEACON_SLOT_COUNT)
 
@@ -190,6 +219,51 @@
 #define BEACON_CH39_BIT                      0x04u
 #define BEACON_CH_ALL                        0x07u
 
+// ── Phase 2: observation window & stepped-power PDR (watch) ──────────────────
+// Engine spec §3.3. Within one full-duty observation window the watch attributes
+// every received advertisement to a slot via its Minor tag, then asks one binary
+// question per reduced-power slot: did anything arrive?
+//
+// WHAT COUNTS AS "COVERED" (spec §3.3 does not say; this is the rule that works).
+// Not a timing calculation. A cycle is covered when EITHER of its slots was
+// heard — that alone proves the cycle occurred and that the window spanned it,
+// with no need for the watch to know the anchor's schedule phase or clock. A
+// cycle whose HI slot arrived but whose LO slot did not is a genuine miss; a
+// cycle the window merely clipped contributes nothing to either count. This is
+// what makes the statistic self-calibrating: as the anchor gets far enough that
+// even HI slots are lost, the denominator shrinks and PDR abstains rather than
+// manufacturing misses. Measured on hardware (tests/prox_v2_spikes.md §S1a):
+// HI slots land 100% of the time at 4.8 PDU/slot, so the denominator is solid
+// wherever the anchor is audible at all.
+#define PDR_OBS_MAX_CYCLES                   8        // ring depth; 1800 ms / 500 ms ~= 4
+#define PDR_MIN_COVERED                      2        // below this, abstain entirely
+
+// Beta parameters from spec §11: near {8,2}, away {1,9}. Used as their point
+// means (p_near = 0.8, p_away = 0.1) rather than full Beta-binomial tails: the
+// accumulated counts are already motion-decayed fractions, for which a
+// Beta-binomial in integer hits is not defined, and the HMM's own N_eff draw
+// gate is what bounds accumulated confidence. Per-slot Bernoulli log-LRs:
+//   hit  -> ln(0.8 / 0.1) = +2.079 nats
+//   miss -> ln(0.2 / 0.9) = -1.504 nats
+#define LL_PDR_HIT_Q8                        532
+#define LL_PDR_MISS_Q8                       (-385)
+
+// Asymmetric caps. This is NOT tuning — it is the §13.0 governing invariant
+// ("an attenuating adversary can fabricate AWAY but never NEAR") applied to the
+// one feature most exposed to it. PDR is a bare amplitude threshold on a single
+// emitter, so a watch pressed into a mattress produces exactly the same LO-slot
+// misses as a watch carried out of the room. A *hit* at reduced power cannot be
+// forged by attenuation — nothing a user drapes over the radio makes a marginal
+// link close — so hits are trusted at full strength while misses are deliberately
+// capped at half. PDR may therefore corroborate AWAY but never carry it alone.
+#define LL_PDR_NEAR_MAX_Q8                   768      // +3.0 nats, == HMM_EMIT_MAX_Q8
+#define LL_PDR_AWAY_MAX_Q8                   (-384)   // -1.5 nats, deliberately half
+
+// Accumulator ceiling, in covered slots. Bounds how much standing confidence the
+// PDR channel can hold; both counts are rescaled together on overflow so the
+// estimated rate survives untouched.
+#define PDR_MAX_EFF_SLOTS                    8
+
 // Motion states — same encoding as the P2 vector trailer's motion_state byte.
 #define PROX_MOTION_STILL       0u
 #define PROX_MOTION_FIDGET      1u
@@ -204,14 +278,59 @@
 // ── Mode A: fingerprinting ──────────────────────────────────────────────────
 #define PROX_MAX_DEVICES                     60
 #define PROX_MIN_DEVICE_COUNT                8
+// Minimum devices shared between the watch vector and the anchor's fresh cache
+// before Pearson's r means anything. At k=2 the correlation is mathematically
+// +/-1 whatever was measured (two points always lie on a line), so the score
+// saturates to 0 or 255 -- observed on hardware as a still watch beside a still
+// anchor emitting 0, 0, 255, 0, 255. Standard error is roughly 1/sqrt(k-3), so
+// 6 is the point where the estimate carries more signal than arithmetic.
+#define PROX_MIN_SHARED_DEVICES              6
+// Criterion-neutral score returned when no signal has enough data. NOT 0: an
+// absent measurement is not evidence of distance, and 0 reads as confident AWAY.
+#define PROX_STARVED_SCORE                   128
 #define PROX_MIN_MTU_BYTES                   256
 #define PROX_CONFIDENCE_THRESHOLD_U8         170
 #define PROX_MISSING_RSSI_DBM                (-100)
 #define PROX_MIN_FINGERPRINT_WEIGHT          5.0f
 #define PROX_MIN_VARIANCE                    4.0f      // dBm^2 floor (~2 dB sigma)
 #define PROX_ALPHA_W0                        2000.0f
-#define PROX_LL_CENTER                       (-3.0f)
-#define PROX_LL_SCALE                        0.5f
+
+// ── Self-RSSI discriminant (the anchor's own beacon level) ──────────────────
+// WHY THIS EXISTS. Signals A and B are both blind to the single most
+// discriminative measurement in the vector. Pearson is affine-invariant, so a
+// uniform level shift cancels EXACTLY; the fingerprint is a shape match over
+// third-party emitters. Meanwhile the anchor's own beacon measured 12 dB apart
+// between a real install's INSIDE and EDGE positions (-80 vs -92 dBm, S1a),
+// against a per-position spread of only ~2-3 dB — a feature with d' ~ 4-6 on its
+// own, where the whole rest of the score managed d' = 1.7.
+//
+// THE TRADE-OFF, STATED. Pearson's affine invariance is exactly what makes it
+// resistant to the occlusion attack (§13): smothering the watch attenuates
+// everything at once and cancels out. Re-introducing an absolute level term
+// re-introduces that attack surface. It is therefore capped ASYMMETRICALLY, on
+// the §13.0 invariant "an attenuating adversary can fabricate AWAY but never
+// NEAR": a strong self-RSSI cannot be forged by attenuation and is trusted at
+// full weight, while a weak one — which is what both distance AND bedding
+// produce — is worth half as much. The AWAY direction is thus bounded to a
+// modest fraction of the score range and can corroborate but never carry.
+#define PROX_SELF_UP_MAX_U8                  48       // strong self-RSSI: full trust
+#define PROX_SELF_DOWN_MAX_U8                24       // weak self-RSSI: deliberately half
+// Below this demonstrated INSIDE-vs-EDGE span the two positions are not
+// distinguishable by level at all, and the term abstains rather than amplify
+// noise into a decision.
+#define PROX_SELF_MIN_SPAN_DB                6
+#define PROX_STRINGIFY_(x) #x
+#define PROX_STRINGIFY(x)  PROX_STRINGIFY_(x)
+// Maps signal_fingerprint()'s MEAN STANDARDISED RESIDUAL (0 for a perfect match,
+// -0.5 at 1 sigma, -2 at 2 sigma, -4.5 at 3 sigma) onto [0,1]. Retuned when the
+// Gaussian normalisation term was removed from that average — see the comment in
+// signal_fingerprint() for why it had to go. Resulting curve:
+//     perfect  -> 0.90     1 sigma -> 0.82
+//     2 sigma  -> 0.32     3 sigma -> 0.01
+// so a well-matched fingerprint can now assert NEAR instead of only ever pulling
+// the score down toward the middle.
+#define PROX_LL_CENTER                       (-1.5f)
+#define PROX_LL_SCALE                        1.5f
 #define PROX_COLLECT_SCORE_THRESHOLD         0.75f
 #define PROX_COLLECT_AMBIGUITY_MARGIN_DBM    10
 #define PROX_NVS_PERSIST_INTERVAL_S          300
@@ -234,6 +353,46 @@
 #define ANCHOR_NEAR_RSSI_THRESHOLD_DBM       (-68)     // raw-RSSI fallback only (passive)
 #define PROX_MAX_PEER_ANCHORS                16
 
+// ── Watch scan cache: multi-window sampling-noise suppression ────────────────
+// A single scan window is a *random subset* of the BLE population, not a census.
+// Advertisers are asynchronous with 100 ms–10 s intervals, so a 700 ms window
+// catches a 2 s advertiser only ~35% of the time. Field measurement (still watch,
+// still anchor) showed the vector swinging 21–31 devices query-to-query and the
+// resulting Pearson score swinging 26–159 — with a frozen channel, i.e. entirely
+// estimator noise with no physical signal behind it.
+//
+// The fix is to stop treating one window as one observation. The cache keeps the
+// last PROX_CACHE_TTL_MS of per-window maxima per device and reports the median, so:
+//   * membership stabilises — over a 40 s window a 2 s advertiser is caught
+//     with near-certainty instead of ~35% per 700 ms scan;
+//   * per-reading RSSI noise averages down;
+//   * a hit count becomes available, so the MTU-capped device slots can be spent
+//     on persistent emitters rather than whichever ephemerals happened to appear.
+//
+// NOTE this does NOT violate the frozen-fade rule (§1.2). There are two distinct
+// noise sources and only one of them is frozen when the wrist is still:
+//   * the fading draw is frozen — averaging it adds confidence, not information,
+//     which is exactly what N_eff exists to refuse; and
+//   * the *subset* drawn by each scan is re-randomised every window regardless of
+//     motion, so averaging it removes real error.
+// This cache averages the second only. N_eff accounting is untouched, so a still
+// wrist still earns no positional evidence — it just stops being fed noise.
+// The cache is bounded by WALL TIME, not by a window count. A count alone ties
+// coverage to the query cadence, and that broke as soon as queries got faster:
+// holding one GATT link open across a calibration burst cut the per-query cost
+// from a multi-second connect to a write plus a read, so queries went from ~10 s
+// apart to ~2 s. Four windows then spanned ~8 s of advertising opportunity
+// instead of ~40 s, and vector sizes collapsed to 8-13 devices on some queries
+// (measured range 8..31). More frequent sampling with less coverage per sample is
+// the opposite of the intent.
+//
+// PROX_CACHE_TTL_MS is the real knob: a device is carried for this long after it
+// was last heard, whatever the query rate. PROX_CACHE_SAMPLES only caps how many
+// per-window maxima are retained for the median.
+#define PROX_CACHE_SAMPLES                   8
+#define PROX_CACHE_TTL_MS                    40000
+#define PROX_RSSI_ABSENT                     (-128)    // sentinel: not seen in that window
+
 // ── Calibration-v2: per-anchor demonstrated near-zone threshold ──────────────
 // Score-distribution collectors (INSIDE vs EDGE) fed during calibration; a
 // 32-bucket histogram over 0..255 (8 counts/bucket) gives cheap p10/p90.
@@ -245,6 +404,27 @@
 // flag low confidence (decision 3).
 #define PROX_CALIB_THRESHOLD_MARGIN_U8       8
 #define PROX_CALIB_MIN_SAMPLES               5
+// Deferred scoring (see prox_calib_collect / prox_calib_finalize).
+//
+// The INSIDE leg trains the fingerprint it is simultaneously being scored by, so
+// the score changed meaning *during* the run: because
+// alpha = exp(-W_total/PROX_ALPHA_W0), early samples were scored by Signal A
+// alone and late ones by Signal B. Field measurement, one continuous INSIDE leg
+// with the anchor's flash freshly erased:
+//
+//     scored with fp < 10 devices    n= 6   mean 213
+//     scored with fp >= 20 devices   n=13   mean 158
+//
+// A 55-point drift inside one leg — larger than the INSIDE-vs-EDGE separation
+// the calibration exists to measure, and it made the pooled INSIDE p10 collapse
+// into the EDGE p90. Percentiles over a mixture of two estimators are not
+// percentiles of anything.
+//
+// Fix: buffer the demonstrated vectors, then at FINALIZE train once and re-score
+// every buffered sample against the *final* fingerprint — the estimator that
+// will actually be deployed. Both legs then sit on one scale.
+#define PROX_CALIB_BUF_SAMPLES               16   // retained per leg (reservoir-sampled)
+#define PROX_CALIB_BUF_DEVICES               24   // strongest devices kept per sample
 // Hysteresis band below a calibrated per-anchor threshold: scores in
 // [near_threshold - HYST, near_threshold) read AMBIGUOUS (resolved to the
 // fail-safe-compliant/AWAY side by callers). Decision 4.
@@ -465,7 +645,17 @@ int             prox_maybe_update_fingerprint(const ProxScanVector* watch_vec,
 //          5 ambiguous (a peer anchor was comparably close).
 // self_rssi — the anchor's own RSSI as found in that vector (0 = not found).
 int             prox_last_train_reason(void);
+// Sample sizes behind the last score: devices shared with the watch (Signal A's
+// k) and fingerprinted devices actually present in the vector (Signal B's nb).
+// Log these next to any score — a score without its sample size cannot be
+// debugged, as the 0/255 saturation episode demonstrated.
+int             prox_last_shared_count(void);
+int             prox_last_fp_seen(void);
 int8_t          prox_last_self_rssi(void);
+// The anchor's own beacon level within a specific vector (0 = absent from it).
+// Prefer this for logging: prox_last_self_rssi() is only populated by the
+// passive-training path and reads 0 during calibration.
+int8_t          prox_vector_self_rssi(const ProxScanVector* v);
 // Replace fingerprint + registry from an app-provided blob.
 int             prox_load_fingerprint(const uint8_t* blob, size_t len);
 // Deserialize a watch scan vector from the wire format the watch produces with
@@ -510,8 +700,70 @@ int             prox_train_labeled(const ProxScanVector* v, int is_inside);
 // and a 0..255 confidence (0 = overlap/insufficient → low), and clears the
 // collectors.
 void            prox_calib_reset(void);
+// Direct histogram add — records a score that has ALREADY been computed. Prefer
+// prox_calib_collect() during a real calibration: adding live scores mixes
+// samples taken before and after the fingerprint matured (see
+// PROX_CALIB_BUF_SAMPLES), which is what made a demonstrated 55-point INSIDE
+// drift swamp the INSIDE/EDGE separation on hardware.
 void            prox_calib_add(int is_inside, uint8_t score);
+// Buffer a demonstrated vector for deferred scoring at FINALIZE. Reservoir-
+// sampled to PROX_CALIB_BUF_SAMPLES per leg, so a long INSIDE roam is not biased
+// toward either end of the walk. When anything has been collected, FINALIZE
+// trains once and then re-scores every buffered sample on the final fingerprint,
+// putting both legs on one scale.
+void            prox_calib_collect(const ProxScanVector* v, int is_inside);
+// Total samples OFFERED to a leg (not the retained count) — for progress UI.
+int             prox_calib_collected(int is_inside);
 uint8_t         prox_calib_finalize(uint16_t* inside_n, uint16_t* edge_n, uint8_t* confidence);
+
+// Why the last prox_calib_finalize() decided what it did. Captured inside
+// finalize (which resets the histograms on the way out), so call it afterwards.
+// Returns 0 if no calibration has been finalized since boot.
+//
+// The two "did it work" numbers are dprime_x10 and best_err_pct, and they answer
+// a different question from the pass/fail:
+//   - `fail` says whether the SHIPPED RULE (edge p90 + margin < inside p10)
+//     admitted a cutoff.
+//   - `dprime_x10` says whether the two clouds are separable AT ALL, in pooled
+//     standard deviations. Near zero means the score itself is not discriminating
+//     between the positions and no threshold rule can rescue it — look upstream
+//     (shared device count, fingerprint, geometry), not at the rule.
+//   - `best_err_pct` is the misclassification rate of the best cutoff that
+//     exists. A large d' and a low best_err with fail=OVERLAP means the clouds
+//     ARE separable and only the conservative percentile rule refused — usually a
+//     few outlier samples in the tails.
+typedef struct {
+    uint16_t inside_n, edge_n;
+    uint8_t  inside_mean, edge_mean;     // score units, from bucket centres
+    uint8_t  inside_sd,   edge_sd;
+    uint8_t  inside_p10,  edge_p90;      // the two percentiles the rule compares
+    uint8_t  inside_min,  inside_max;
+    uint8_t  edge_min,    edge_max;
+    uint8_t  threshold;                  // what finalize returned
+    uint8_t  confidence;
+    int16_t  gap;                        // inside_p10 - (edge_p90 + margin); <= 0 is overlap
+    uint8_t  dprime_x10;                 // separation in pooled SDs, x10, saturating at 255
+    uint8_t  best_thr;                   // error-minimising cutoff over the two histograms
+    uint8_t  best_err_pct;               // its total misclassification rate
+    uint8_t  edge_above_pct;             // % of EDGE samples at or above inside_p10
+    uint8_t  inside_below_pct;           // % of INSIDE samples at or below edge_p90
+    uint8_t  fail;                       // PROX_CALIB_FAIL_* bitmask, 0 = accepted
+} ProxCalibStats;
+
+#define PROX_CALIB_FAIL_FEW_INSIDE  0x01u
+#define PROX_CALIB_FAIL_FEW_EDGE    0x02u
+#define PROX_CALIB_FAIL_OVERLAP     0x04u
+
+int             prox_calib_last_stats(ProxCalibStats* out);
+
+// Self-RSSI discriminant (see PROX_SELF_UP_MAX_U8). The near/away levels are
+// learned from the two calibration legs and persisted; until they are, the term
+// abstains and the score is exactly what it was before.
+//   out_near/out_away: learned levels in dBm (0 when uncalibrated)
+// Returns 1 when the term is armed.
+int             prox_self_levels(int8_t* out_near, int8_t* out_away);
+// Score adjustment the last prox_compute_score() applied, in score units.
+int             prox_last_self_delta(void);
 // Per-anchor decision threshold in score space (0 = uncalibrated → use global
 // PROX_CONFIDENCE_THRESHOLD_U8). Persisted alongside the fingerprint NVS blob.
 void            prox_set_near_threshold(uint8_t thr);
@@ -520,10 +772,29 @@ uint8_t         prox_get_near_threshold(void);
 
 // ---- Mode A: watch side ----
 #ifdef PROXIMITY_ROLE_WATCH
-// Called by the platform scan callbacks while assembling a vector.
+// Called by the platform scan callbacks while assembling a vector. Within one
+// window the STRONGEST reading per device wins (do not average here: an anchor
+// running the beacon schedule alternates TX_HI/TX_LO 30 dB apart within a single
+// window, and the max correctly selects the TX_HI slot).
 void   prox_ingest_scan_result(const uint8_t mac[6], uint8_t type, int8_t rssi);
-// Snapshot the current scan into a vector (keeps strongest PROX_MAX_DEVICES).
+// Close the current scan window: fold this window's per-device maxima into the
+// rolling history, age out samples older than PROX_CACHE_TTL_MS, and
+// start a fresh window. Call once after each completed scan, before building a
+// vector. Idempotent — a window with no ingested results is not folded.
+void   prox_scan_window_close(void);
+// Drop all cached history (ENFORCEMENT entry, or any known discontinuity).
+void   prox_scan_cache_reset(void);
+// Build a vector from the cache: per-device RSSI is the median of that device's
+// retained per-window maxima, and the PROX_MAX_DEVICES slots are spent on the
+// most *persistent* devices first (hit count, then RSSI) rather than simply the
+// strongest — a device seen in 4/4 windows is worth far more to the correlation
+// than one seen 1/4, and the MTU cap means the choice is forced. Does NOT clear
+// the cache; call prox_scan_window_close() to advance the window.
 void   prox_build_scan_vector(ProxScanVector* out);
+// Diagnostics: how many devices the cache is holding, and how many of those were
+// seen in every retained window (the "stable core").
+int    prox_scan_cache_count(void);
+int    prox_scan_cache_stable_count(void);
 // Serialize / parse the wire format (spec §6.3.1). Returns bytes written/read, 0 on error.
 size_t prox_serialize_vector(const ProxScanVector* v, uint8_t* out, size_t cap);
 #endif
@@ -539,6 +810,33 @@ void    prox_note_sleep_interval(uint32_t slept_ms, int motion_woke);
 // LL_CONNFAIL_AWAY_Q8 into the next tick's emission when the last advertisement
 // was at or below PROX_FAR_RSSI_THRESHOLD_DBM; abstains otherwise.
 void    prox_note_connect_failure(int8_t last_advert_rssi_dbm, int have_advert);
+
+// ---- Observation window & stepped-power PDR (§3.3) ----
+// One window per anchor query, wrapped around the full-duty aligned scan:
+//   prox_obs_begin(anchor_mac);
+//   ... scan callback calls prox_obs_note() for every Impulse advertisement ...
+//   prox_obs_close(&hits, &covered);
+//
+// note() filters by MAC and ignores legacy all-zero Minors itself, so the
+// platform can hand it every beacon it parses without pre-checking anything.
+// close() reduces the window to hits/covered, folds them into the motion-decayed
+// accumulator, and queues the resulting log-LR as watch-local HMM evidence for
+// the next tick — the same seam prox_note_connect_failure() uses, and for the
+// same reason: PDR needs no wire field, so it does not wait for the P2 trailer.
+//
+// close() returns 1 when the window produced usable evidence, 0 when it
+// abstained (fewer than PDR_MIN_COVERED cycles heard). Both out params may be
+// NULL; they are written even when the window abstains, for logging.
+void prox_obs_begin(const uint8_t anchor_mac[6]);
+void prox_obs_note(const uint8_t mac[6], uint16_t minor, int8_t rssi);
+int  prox_obs_close(uint8_t* out_hits, uint8_t* out_covered);
+
+// Accumulator inspection, for shadow logging and the S1a bench. rate_u8 is the
+// decayed hit rate scaled 0..255, covered the decayed denominator in whole
+// slots, loglr_q8 what close() last queued (0 while abstaining). Returns 0 if
+// the channel is currently abstaining.
+void prox_pdr_reset(void);
+int  prox_pdr_state(uint8_t* out_rate_u8, uint8_t* out_covered, int32_t* out_loglr_q8);
 
 // STILL / FIDGET / LOCOMOTION / UNKNOWN, recomputed on demand from the burst,
 // interrupt and sleep-interval evidence. UNKNOWN once the channel goes stale
