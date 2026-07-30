@@ -6,9 +6,9 @@ actually been met, not when it looks likely.
 
 | Spike | Question | Status |
 |---|---|---|
-| S1a | Which TX levels does the C3 emit, and where does the near-band link close but not the far one? | **BLOCKED — needs hardware** |
+| S1a | Which TX levels does the C3 emit, and where does the near-band link close but not the far one? | **PASS — 2026-07-30, both positions swept; BEACON_TX_LO_DBM = -6** |
 | S1b | Can advertising be restricted to one channel per slot on this NimBLE? | **RESOLVED in source; on-air confirmation outstanding** |
-| S2 | Does a 250 ms adv stop/reconfig/start cycle keep the anchor connectable and its scan tasks fed? | **BLOCKED — needs hardware** |
+| S2 | Does a 250 ms adv stop/reconfig/start cycle keep the anchor connectable and its scan tasks fed? | **PARTIAL — reconfiguration shown not to degrade connectability; absolute criterion needs the real firmware pair** |
 | S3 | LIS3DH burst thresholds on real wrists | **PARTIAL — resting floor measured, motion classes outstanding** |
 | S4, S5 | CSI / FTM (pre-P4 only) | not started; not needed before P4 |
 
@@ -119,23 +119,247 @@ the fallback is not a crippled mode.
 
 ## S1a — TX_LO level table
 
-**BLOCKED.** Requires measuring, at real distances, which advertising TX power
-level closes the link at 1–4 ft but not at ~10 ft (pass: ≥90 % slot-hit at 3 ft,
-≤30 % at 10 ft LOS). No amount of source reading substitutes for this. Until it
-is run, `BEACON_TX_LO_DBM` keeps the spec's placeholder of −21 dBm, and the PDR
-distributions must be treated as untrained.
+**PASS — the pass criterion was met on 2026-07-30 with a full 12-level sweep at
+both positions of a real install: `BEACON_TX_LO_DBM = -6` gives 97 % slot-hit
+INSIDE and 0 % at EDGE (criterion: >=90 % / <=30 %). Working and analysis in
+`spike_s1a_txlo.md` "result 2 part 2".**
 
-Note the ESP32-C3's advertised TX levels are quantised (`ESP_PWR_LVL_N24`
-… `ESP_PWR_LVL_P9`); the spike should record the *measured* level per enum
-value, since the nominal and actual differ.
+The bench characterisation below (2026-07-29, two tethered C3s) established the
+level ladder, the cliff shape and the active-scan hazard; the install sweep that
+closes the criterion is summarised at the end of this section.
+
+Measured with `bench/pdr_sweep/` (two roles from one source tree, linking the
+shipped `prox_beacon_minor_encode/decode`). Method: a 2-slot cycle — a +9 dBm
+reference slot and a swept slot — 250 ms per slot, 50 ms advertising interval,
+40 cycles per level, all 12 levels, 4 min per run. The receiver derives the
+**denominator arithmetically** from the observed `cycle_seq` range rather than
+trusting anything the transmitter claims, so a level whose swept slot was never
+heard at all still has a valid denominator from the reference slots bracketing it.
+
+### Finding 1 — the level ladder is real, and −24 dBm is the floor
+
+`NimBLEDevice::setPower(dbm)` computes `esp_power_level_t(dbm/3 + ESP_PWR_LVL_N0)`
+with `ESP_PWR_LVL_N0 == 8` on this IDF (4.4.7, esp32c3 `esp_bt.h`). Probed by
+calling it for every dBm in −30…+21 and reading `getPower()` back:
+
+- **−27 and below are REJECTED** (`setPower` returns false; index would be −1).
+  **−24 dBm is the hard floor.**
+- Everything −26…+21 is accepted and quantised to exactly 3 dB.
+- **Rounding is toward HIGHER power**: −26 and −25 both become −24; −23 and −22
+  both become −21. Requesting a non-multiple of 3 silently buys you *more* power
+  than you asked for, never less. `BEACON_TX_LO_DBM` must be a multiple of 3.
+
+On air the commanded level tracks 1:1 over the usable range — this is the trap
+("setPower silently rounds or ignores") closed: +9→−81, +6→−84, +3→−87, 0→−90 dBm
+received, exactly 3 dB per step. Below about −90 dBm received the curve flattens
+(−3→−92, −6→−95, −9→−95, −12→−98), which is floor truncation plus survivor bias,
+not a power-setting failure: only the strongest packets get through, so the mean
+of what arrives is biased upward.
+
+### Finding 2 — the cliff, and the number that generalises
+
+Passive scan, 100 % duty. `cycles` is the arithmetic denominator; `hi` is the
++9 dBm reference slot, `lo` the swept slot.
+
+| swept dBm | lo slot-hit | lo PDU/ref PDU | lo RSSI | hi slot-hit | hi RSSI |
+|---|---|---|---|---|---|
+| −24 | 0 % | 0/349 | — | 100 % | −81 |
+| −21 | 0 % | 0/184 | — | 100 % | −81 |
+| −18 | 0 % | 0/192 | — | 100 % | −81 |
+| −15 | **15 %** | 6/185 | −102 | 100 % | −81 |
+| −12 | **82 %** | 46/189 | −98 | 100 % | −81 |
+| −9 | **95 %** | 65/187 | −95 | 100 % | −81 |
+| −6 | 100 % | 160/186 | −95 | 100 % | −81 |
+| −3 | 100 % | 183/183 | −92 | 100 % | −81 |
+| 0 | 100 % | 175/186 | −90 | 100 % | −81 |
+| +3 | 100 % | 191/189 | −87 | 100 % | −81 |
+| +6 | 100 % | 188/191 | −84 | 100 % | −81 |
+| +9 | 100 % | 182/189 | −81 | 100 % | −81 |
+
+Controls that make this table trustworthy: the reference slot held **100 % hit
+and −81 dBm at every one of the 12 levels** across the whole 4 minutes, so the
+geometry did not drift and the denominator is solid; at +9 dBm the swept slot
+reads −81 too, identical to the reference, which is the internal consistency
+check that the two slots differ only in power; and the transmitted `slot_id`
+agreed with the arithmetic cycle→level map on **every single packet**
+(`mism=0`), so slot attribution via the Minor field is exact.
+
+**The number that transfers between installations is the receiver threshold, not
+the TX level.** Slot-hit as a function of *received* power: 100 % at ≥ −95 dBm,
+≈50 % at −97, 0 % by −101. That is a ~6 dB transition and it is a property of the
+C3's receiver, so it holds in any room. TX level and path loss are per-install.
+
+Hence the **calibration rule**, which needs no sweep — only the reference slot's
+RSSI at the two positions, which the watch already measures:
+
+```
+BEACON_TX_LO_DBM  ~=  -91 - RSSI_HI_at_EDGE      (rounded DOWN to a multiple of 3)
+usable only if     RSSI_HI_at_INSIDE - RSSI_HI_at_EDGE  >=  ~6 dB
+```
+
+Derivation: `RSSI_HI = 9 - PL`, so `PL = 9 - RSSI_HI`; wanting the LO slot to
+land near −100 dBm at the edge gives `TX_LO = -100 + PL = -91 - RSSI_HI_edge`.
+
+### Finding 3 — the placeholder −21 dBm is almost certainly unusable
+
+This bench's path loss is 90 dB (+9 dBm out, −81 dBm in). At −21 dBm the link
+needs `PL <= 74 dB` to stay above the −95 dBm reliable-hit threshold — **16 dB
+less loss than this bench had**. Any install with comparable path loss would
+read **0 % PDR everywhere, including inside the near-zone**: the feature would
+assert AWAY permanently. Per the rule above, this geometry wants ≈ **−12 dBm**.
+
+`BEACON_TX_LO_DBM` is therefore moved from −21 to **−12** as the shipping
+default. This is a better-founded default, not a calibrated value: it is correct
+for one measured geometry, and §8's `PROX_FLAG_TXLO_MISCAL` path (near-leg
+PDR < 0.8 ⇒ suggest another level) remains the mechanism that fixes it per install.
+
+> **Caveat, stated plainly.** 90 dB at desk range is much higher than free-space
+> would predict (~30–40 dB at 30 cm). The two boards are USB-tethered beside a
+> laptop with cables across the PCB antennas, so absolute path loss here is not
+> representative of a bedroom. The *receiver threshold*, the *3 dB-per-step
+> linearity*, the *cliff width* and the *slot-vs-PDU margin* are radio properties
+> and do transfer. The absolute dBm recommendation does not, which is exactly why
+> it is expressed as a rule keyed to measured RSSI.
+
+### Finding 4 — slot-hit really is the right statistic
+
+The spec's choice of "did ≥1 PDU arrive in this slot" over raw PDU delivery ratio
+is vindicated with ~2 slots of margin to spare: at −12 dBm only **24 %** of PDUs
+arrived, yet **82 %** of slots were hit; at −15 dBm, 3 % of PDUs still yielded
+15 % of slots. Roughly 5 PDUs per slot is what buys that, and the reference slot
+measured 4.6–4.9 PDU/slot — matching §3.1's prediction.
+
+### Finding 5 — ACTIVE scanning breaks the measurement (and probably the vector)
+
+The identical sweep with the receiver in **active** scan mode, everything else
+held constant:
+
+| | reference slot-hit | reference PDUs / 40 cycles | reference RSSI |
+|---|---|---|---|
+| passive | **100 % at all 12 levels** | ~186 | −81 |
+| active | **30–95 %, erratic** | 13–114 | −81 |
+
+RSSI is unchanged, so this is not link budget — the receiver is missing
+advertisements because it is transmitting SCAN_REQs and awaiting SCAN_RSPs
+instead of listening, while the advertiser is interrupting its own schedule to
+answer them. It also moves the apparent cliff by ~9 dB (−12 dBm reads 12 %
+active vs 82 % passive), which would mis-set `TX_LO` by three whole levels.
+
+**PDR must be measured on a passive window.** The consequence is larger than PDR,
+because `prox_aligned_active_scan()` sets `setActiveScan(true)` for the same
+window the *proximity vector* is built from — and losing 40–70 % of
+advertisements would degrade the device census too. The watch's parse path reads
+the anchor UUID out of the ADV_IND manufacturer data, and every BLE advertiser is
+visible to a passive scan (scan responses add payload, never new devices), so
+there is no known reason the window needs to be active.
+
+That last step is an **inference, not a measurement**: it was measured for one
+advertiser, not for a multi-device census. Flipping the window to passive is
+recorded as the recommendation, and left for a field run to confirm against real
+vector sizes — it is a one-line change and a plausible contributor to the
+`n = 8..31` vector-size churn seen in the field.
+
+### Finding 6 — the two-position result (2026-07-30) closes the spike
+
+Full 12-level sweep at both positions of a real install. Reference slot: INSIDE
+median −80 dBm, EDGE median −92 dBm — **12 dB of separation**, path loss 89 and
+101 dB. `hi_pct` 97–100 % everywhere, `mism = 0`.
+
+| TX_LO | INSIDE hit | EDGE hit | |
+|---|---|---|---|
+| −15 | 27 % | 0 % | |
+| −12 | 40 % | 0 % | |
+| −9 | 62 % | 0 % | |
+| **−6** | **97 %** | **0 %** | **PASS — chosen** |
+| −3 | 100 % | 15 % | passes, but see below |
+| 0 | 100 % | 50 % | edge fails |
+| +3…+9 | 100 % | 87–97 % | edge fails |
+
+Two levels meet the criterion. **−6 dBm is chosen because it centres the level on
+the point where PDR's log-LR changes sign** — 42 % hit rate (`385/917`), reached
+at ≈ −101 dBm received — leaving a symmetric ±6 dB margin. Both positions showed
+±3 dB of RSSI wander, and −3 dBm sits only 3 dB from that crossover at the edge,
+where a 3 dB gain would tip PDR into asserting NEAR outside the zone.
+
+**Per-install rule, corrected.** Finding 2's `-91 - RSSI_HI_at_EDGE` was wrong: it
+used only the edge, and it treated `lo_rssi` as unbiased when it is conditioned on
+reception (so it reads several dB strong at low hit rates). Applied here it gives
++1.5 dBm, where the edge measures 50 %. Use instead:
+
+```
+BEACON_TX_LO_DBM = -92 - (RSSI_HI_inside + RSSI_HI_edge)/2   (round to a multiple of 3)
+feasible only if   RSSI_HI_inside - RSSI_HI_edge >= ~7 dB    (>=10 dB for comfort)
+```
+
+**And a retraction.** Finding 2 claimed the received-power threshold generalises
+between installs. Within one install it does — the two positions above trace a
+single curve. Across installs it shifts: the bench read 82 % at −102 dBm where
+this install reads ~40 %, i.e. the bench sat ~3–4 dB more sensitive, almost
+certainly a quieter noise floor. Hit rate is set by SNR, not signal alone. The
+curve's *shape* transfers and the rule is a sound starting point, but the sweep
+is the calibration.
 
 ## S2 — 250 ms reconfiguration stability
 
-**BLOCKED.** Requires the anchor powered and a watch making repeated proximity
-connects (pass: 100 consecutive connects succeed while the schedule runs, scan
-staleness unchanged). Its fallback — `BEACON_SLOT_MS = 500` with
-`PROX_OBSERVE_WINDOW_MS` scaled to 3600 — is a constant change only, so P2 code
-does not need restructuring if S2 fails.
+**PARTIAL — measured 2026-07-29. The risk this spike was gating is not present:
+reconfiguring the advertiser every 250 ms does not degrade connectability. The
+absolute "100 consecutive connects" criterion is not met by this harness, but it
+is not met by the control either, so the harness is the limit, not the anchor.**
+
+Method: the `bench/pdr_sweep` transmitter also runs a GATT server (one service,
+one readable characteristic). The receiver repeatedly stops scanning, connects,
+discovers the service, reads the characteristic, verifies its value, disconnects
+and resumes scanning — the same single-radio hand-off the watch performs. Four
+conditions, otherwise identical:
+
+| condition | connects OK | connect fail | read fail | t_mean | t_max |
+|---|---|---|---|---|---|
+| schedule, restart on (**shipping config**) | **53/60 (88.3 %)** | 7 | **0** | 543 ms | 1350 ms |
+| schedule, restart off | **53/60 (88.3 %)** | 7 | **0** | 506 ms | 1200 ms |
+| **no schedule at all (control)** | **45/60 (75.0 %)** | 15 | **0** | 456 ms | 1100 ms |
+| schedule, restart on, 1200 ms settle | 32/40 (80.0 %) | 8 | **0** | 610 ms | 1300 ms |
+
+### What this establishes
+
+**The schedule does not hurt connectability.** Both scheduled conditions scored
+88.3 %, the *unscheduled control scored worse at 75 %*, and quadrupling the settle
+time between attempts did not help (80 %). The residual failure rate is therefore
+uncorrelated with advertiser reconfiguration, with `stop()`/`start()`, and with
+inter-attempt spacing — it is a property of the harness's bare
+create/connect/read/delete loop, which has no retry and no connection-parameter
+tuning, unlike the shipping watch (which holds a persistent GATT session via
+`prox_session_begin()` and retries).
+
+That the control is *worse* is explainable rather than noise: with the schedule
+running, `pAdv->start()` is re-issued every 250 ms, which re-arms the advertiser
+after every disconnect race. Without it the advertiser depends on a single
+post-disconnect `start()`.
+
+**Once a link is up, the schedule never disturbs it.** `read_fail = 0` in all
+four conditions — **183/183 established connections** completed full service
+discovery and a characteristic read while the advertiser was being stopped,
+re-powered and restarted underneath them. That is the substantive half of §3.1's
+"the anchor remains connectable in every slot".
+
+**The stop/start is not needed at all** (from S1a's no-restart sweep): the Minor
+payload updates live and the TX power change applies to subsequent advertising
+events without an advertiser restart. `cycle_seq` advanced normally through a
+135 s run with `stop()`/`start()` removed, and the PDR cliff landed in the same
+place within binomial noise. Dropping the restart is therefore available as a
+simplification, though S2 shows it is not required for connectability.
+
+### Not established
+
+- The stated **100-consecutive-connect** criterion. Needs the real anchor and the
+  real watch, whose session/retry behaviour is what the criterion implicitly
+  assumes; this harness cannot demonstrate it in any condition, including with
+  the schedule disabled.
+- **Scan staleness** is not cleanly measured here: the receiver stops scanning for
+  every connect attempt, so the observed 1.8–5.1 s max beacon gaps are dominated
+  by that, not by scan starvation on the anchor.
+
+The fallback (`BEACON_SLOT_MS = 500`, `PROX_OBSERVE_WINDOW_MS` → 3600) remains a
+constants-only change and is not currently needed.
 
 ## S3 — LIS3DH burst thresholds
 
