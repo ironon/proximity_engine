@@ -111,9 +111,19 @@ From one window, per target (and rival) anchor:
 
 $$\text{PDR}_{\text{LO}} = \frac{\text{hits}}{\text{LO slots covered}} \in \{0, \tfrac{1}{3}, \tfrac{2}{3}, 1\} \text{ per window}$$
 
-Hits/covered counts (not the ratio) accumulate in the integrator as Beta-posterior counts across polls, decayed on motion-state reset. The likelihood ratio $\text{LR}_{\text{pdr}}$ uses Beta-binomial tails from calibrated (or default) near/away parameters.
+Hits/covered counts (not the ratio) accumulate in the integrator as Beta-posterior counts across polls, decayed on motion-state reset. The likelihood ratio $\text{LR}_{\text{pdr}}$ uses Beta-binomial tails from calibrated (or default) near/away parameters. **Implementation deviation (recorded):** the shipped watch-side term uses the two Beta parameter sets as their *point means* ($p_{\text{near}} = 0.8$, $p_{\text{away}} = 0.1$) in a per-slot Bernoulli log-LR, not full Beta-binomial tails. Two reasons: the accumulated counts are motion-decayed *fractions*, for which a Beta-binomial in integer hits is undefined; and the HMM's own $N_{\text{eff}}$ draw gate is already what bounds accumulated confidence, so modelling parameter uncertainty a second time buys precision the gate immediately discards. It also removes the `lgamma` calls and the "2 × small" tail tables §7 budgeted for.
 
 PDR generalizes v1's connect-failure fail-safe (advertisement-receivable-but-unconnectable ⇒ far) into a graded, always-on feature; the connect-failure rule itself is retained as watch-local evidence (§6.3).
+
+**What "covered" means (IMPLEMENTED — this paragraph was previously unspecified).** Not a timing calculation. A cycle counts as covered when **either** of its slots was heard: that alone proves the cycle occurred *and* that the window spanned it, with no need for the watch to know the anchor's schedule phase or clock. A cycle whose HI slot arrived but whose LO slot did not is a genuine miss; a cycle the window merely clipped is heard in neither slot and contributes to neither count. This is what makes the statistic self-calibrating in the fail-safe direction: as an anchor recedes far enough that even HI slots are lost, the denominator shrinks and PDR abstains rather than manufacturing misses. Below `PDR_MIN_COVERED` cycles it abstains outright. Measured on hardware (`tests/prox_v2_spikes.md` §S1a): the HI reference slot lands **100 % of the time at 4.6–4.9 PDU/slot**, so the denominator is solid wherever the anchor is audible at all.
+
+**Slot-hit over PDU ratio is vindicated (MEASURED).** At −12 dBm only 24 % of PDUs arrived yet 82 % of slots were hit; at −15 dBm, 3 % of PDUs still yielded 15 % of slots. The ~5 PDUs per slot buy roughly two slots of margin over a raw delivery ratio.
+
+**The observation window must be PASSIVE (MEASURED — corrects an assumption).** §3.3 called for "full scan duty" without specifying active vs passive, and `prox_aligned_active_scan()` uses **active**. Measured, everything else held constant: passive scanning delivered 100 % HI slot-hit at all 12 power levels; active scanning delivered 30–95 %, erratically, at identical RSSI — the receiver misses advertisements while transmitting SCAN_REQs and awaiting responses, and the advertiser interrupts its own schedule to answer them. It also displaced the apparent cliff by ~9 dB, enough to mis-set `TX_LO` by three levels. Since scan responses add payload but never new devices, and the anchor UUID is carried in the ADV_IND manufacturer data, the window has no known need to be active. **Consequence beyond PDR:** the same window builds the proximity vector, so losing 40–70 % of advertisements plausibly contributes to the field-observed vector-size churn ($n = 8\ldots31$) — measured for one advertiser, inferred for the census, and flagged for a field run to confirm.
+
+**Watch-local pull-forward (IMPLEMENTED).** PDR needs no wire field, so it does not wait for the P2 trailer: `prox_obs_begin/note/close` accumulate motion-decayed Beta counts on the watch and queue a log-LR through the same seam `prox_note_connect_failure()` uses, riding the HMM's $N_{\text{eff}}$ draw gate. The anchor-side $\ell_{\text{pdr}}$ of §5.2 remains P2 lockstep work.
+
+**Anti-tamper asymmetry (§13.0 applied).** PDR is the feature most exposed to the occlusion attack, because a watch pressed into a mattress produces exactly the same LO-slot misses as a watch carried out of the room. A *hit* at reduced power cannot be forged by attenuation; a *miss* can. Hits therefore count at full strength (`LL_PDR_NEAR_MAX_Q8` = +3.0 nats) and misses at half (`LL_PDR_AWAY_MAX_Q8` = −1.5 nats): PDR may corroborate AWAY but never carry it alone. Verified in `tests/test_prox_v2.cpp` — 200 consecutive fully-occluded windows on a motionless wrist reach $\Lambda = -116$ (AWAY needs $-355$), while 10 windows on a moving wrist reach $-766$.
 
 ### 3.4 Spike S1 fallback — power-only schedule
 
@@ -259,6 +269,14 @@ The v0.8 calibration burst (near leg) already exercises the exact query path; v2
 
 - **Leg byte on START** (near = 0x01 default, away = 0x02): the away leg has the user stand across the room; every query is fed to the anchor's away-training gate at high weight, populating the away distributions of §5.3 in ~1 minute instead of days of conservative self-supervision.
 - Burst windows always include LO slots (they use the same observation window), so PDR and $s_{ch}$ distributions train at burst speed too.
+- **Deferred scoring (IMPLEMENTED).** Both demonstrated legs *buffer* their vectors rather than banking the live score; FINALIZE trains once from the INSIDE buffer and then re-scores every buffered sample against the resulting fingerprint. Without this the INSIDE leg trains the fingerprint it is simultaneously being scored by, so `alpha = exp(-W_{tot}/W_0)` collapses mid-leg and the score silently changes scale. Measured on hardware, one continuous INSIDE leg on a freshly-erased anchor: samples scored with fewer than 10 fingerprint devices averaged **213**, those scored with 20 or more averaged **158** — a 55-point drift *within one leg*, larger than the INSIDE/EDGE separation being measured, which collapsed the pooled INSIDE p10 into the EDGE p90. A percentile over a mixture of two estimators is not a percentile of anything. Retention is reservoir-sampled (`PROX_CALIB_BUF_SAMPLES`) so a long INSIDE roam is not biased toward either end of the walk.
+
+  *Known residual:* the INSIDE histogram is scored against a fingerprint trained on those same vectors, so INSIDE is mildly optimistic. This is the intended operating condition rather than a generalisation estimate — at enforcement a genuinely-inside reading is scored against a fingerprint trained on inside readings — but the self-influence is real, and it biases the threshold *upward*, i.e. toward AMBIGUOUS/AWAY, which is the fail-safe direction for `stayNear`. The clean fix is the three-leg protocol below.
+
+- **Three-leg protocol (PLANNED — P2, lockstep).** The correct ordering separates training from measurement entirely: **INSIDE-train → INSIDE-measure → EDGE-measure → FINALIZE**, with the fingerprint frozen for both measurement legs. This removes the self-influence above and lets the threshold be measured out-of-sample on exactly the estimator that will be deployed. Costs one extra user-facing leg and an app protocol change, hence lockstep.
+
+- **Sample-size weighting of the calibration histograms (PLANNED — P2; no wire change, pull-forward eligible).** `prox_calib_add()` currently banks one unweighted count per sample, so a score computed over 8 shared devices is an equal vote with one computed over 23. Pearson's standard error goes as $1/\sqrt{k-3}$, so those are not comparable observations. Field evidence: the worst high-side EDGE outlier in a 12-sample leg (`score=170`, against an EDGE median of 144) came from the smallest vector of the entire run — `shared=8`, exactly at `PROX_MIN_SHARED_DEVICES`. Weight each histogram increment by $\min(1, (k - k_{\min}) / (k_{\mathrm{ref}} - k_{\min}))$ with $k_{\min} =$ `PROX_MIN_SHARED_DEVICES` and $k_{\mathrm{ref}} =$ `PROX_CALIB_K_REF` (default 16), and carry the same weight into the percentile interpolation. The anchor already computes $k$ locally (`prox_last_shared_count()`), so this needs no wire field — it is the same discount §4.3 already applies to fingerprint training weight, applied to the collector that sets the threshold. Note this sharpens the tails rather than solving overlap: two of the three high EDGE samples in that run came from healthy `shared` counts of 17-18.
+
 - Two-point coloc calibration (v1 Mode C §4.5) is unchanged and now also seeds `TX_LO`-band verification: if the near leg shows $\text{PDR}_{\text{LO}} < 0.8$, the engine flags `PROX_FLAG_TXLO_MISCAL` so the app can suggest a different `TX_LO` level (S1 provides the level table).
 
 ---
@@ -345,13 +363,28 @@ BEACON_SCHEDULE_ENABLE            = 1
 BEACON_SLOT_MS                    = 250     // S2 fallback: 500
 BEACON_ADV_INTERVAL_MS            = 50
 BEACON_CYCLE_MS                   = 1500    // derived: 6 × SLOT
-BEACON_TX_LO_DBM                  = -21     // (S1-calibrated)
+BEACON_TX_LO_DBM                  = -6      // S1a-MEASURED at both positions of a real
+                                            // install: 97% hit INSIDE, 0% at EDGE.
+                                            // Was -21, which measured 0% PDR everywhere
+                                            // (permanent false AWAY).
+                                            // MUST be a multiple of 3; -24 is the floor.
+                                            // Per install, centred on the log-LR sign
+                                            // flip (42% hit rate):
+                                            //   -92 - (RSSI_HI_inside + RSSI_HI_edge)/2
+                                            // needs >= ~7 dB of separation to be feasible.
 BEACON_SCHEDULE_EPOCH_OFFSET_MS   = 750     // anchor-pair phase offset (Mode C)
 
 // Observation & PDR (watch)
-PROX_OBSERVE_WINDOW_MS            = 1800    // full-duty; ≥ cycle + slot + margin
-PDR_NEAR_ALPHA_BETA               = {8, 2}
-PDR_AWAY_ALPHA_BETA               = {1, 9}
+PROX_OBSERVE_WINDOW_MS            = 1800    // full-duty PASSIVE; ≥ cycle + slot + margin
+PDR_NEAR_ALPHA_BETA               = {8, 2}  // used as point mean p_near = 0.8
+PDR_AWAY_ALPHA_BETA               = {1, 9}  // used as point mean p_away = 0.1
+PDR_OBS_MAX_CYCLES                = 8       // per-window ledger depth
+PDR_MIN_COVERED                   = 2       // below this the channel abstains
+PDR_MAX_EFF_SLOTS                 = 8       // accumulator ceiling (rate-preserving)
+LL_PDR_HIT_Q8                     = 532     // +2.079 nats, ln(0.8/0.1)
+LL_PDR_MISS_Q8                    = -385    // -1.504 nats, ln(0.2/0.9)
+LL_PDR_NEAR_MAX_Q8                = 768     // +3.0 nats
+LL_PDR_AWAY_MAX_Q8                = -384    // -1.5 nats, half: §13.0 asymmetry
 PROX_TRAIN_AWAY_THRESHOLD         = 0.25
 ANCHOR_PROX_MAX_PEER_ANCHORS      = 8
 
@@ -383,6 +416,19 @@ ENFORCEMENT_POLL_INTERVAL_STILL_S = 600
 CPL_WINDOW_S                      = 12
 CPL_BIN_MS                        = 250
 CPL_MIN_MOTION_BINS               = 8
+
+// Calibration collectors
+PROX_CALIB_BUF_SAMPLES            = 16      // vectors retained per leg (reservoir)
+PROX_CALIB_BUF_DEVICES            = 24      // strongest devices kept per buffered vector
+PROX_CALIB_K_REF                  = 16      // shared-device count earning full histogram weight
+
+// Watch scan cache (sampling-noise suppression; bounded by wall time, not by
+// query count — a count ties coverage to the query cadence, and coverage
+// collapsed 5x when the calibration burst started reusing one GATT link)
+PROX_CACHE_SAMPLES                = 8
+PROX_CACHE_TTL_MS                 = 40000
+PROX_MIN_SHARED_DEVICES           = 6       // Pearson is degenerate below this
+PROX_STARVED_SCORE                = 128     // criterion-neutral; never 0
 
 // Occlusion & tamper resistance (Phase 5 — provisional; S6 sets the real numbers)
 OCC_ENABLE                        = 1       // 0 ⇒ byte-identical to P4
