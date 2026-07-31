@@ -1,7 +1,8 @@
 # Impulse Proximity Engine
 
 A portable C++ module that answers one question, reliably, on a $2 radio:
-
+this readme definitely isn't ai-generated
+no clue what you're on about
 > **Is the watch inside this anchor's zone, right now?**
 
 It runs on both sides of the link — on the battery-powered watch and on the mains-powered anchor — from a single source file pair, with all platform I/O injected through seams. No RTOS dependency, no Arduino dependency, host-compilable, and covered by ~1900 assertions that run without hardware.
