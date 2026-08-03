@@ -208,7 +208,12 @@ Steps 1–3 and 5–7 are the watch; step 4 is the anchor. Modes B/C (`phoneAway
 | [src/proximity.cpp](src/proximity.cpp) | Every algorithm. Role-gated, no platform dependencies. |
 | [src/prox_luts.h](src/prox_luts.h) | Generated lookup tables (see [tools/gen_prox_luts.py](tools/gen_prox_luts.py)). |
 | [proximity_engine_spec_v2.1.md](proximity_engine_spec_v2.1.md) | **The normative design spec.** Physics, phase map, wire formats, threat model. |
+| [src/prox_capture.h](src/prox_capture.h) | Capture record format and the buffered emit/flush API (§9). |
+| [tools/capture_ingest.py](tools/capture_ingest.py) | Laptop side: listen, decode, label, summarise, export for replay. |
+| [tools/schema_check.py](tools/schema_check.py) | Asserts the C structs and the Python decoder still agree. |
+| [corpus/](corpus/) | Captured sessions (JSONL) — the regression corpus `make corpus` replays. |
 | [tests/](tests/) | Host-compiled acceptance tests, both roles, no hardware needed. |
+| [tests/replay.cpp](tests/replay.cpp) | Runs the current engine over past captures. |
 | [tests/prox_v2_spikes.md](tests/prox_v2_spikes.md) | Feasibility spikes S1–S6 and their results. |
 | [tests/spike_s1a_txlo.md](tests/spike_s1a_txlo.md) | The TX-power sweep that set `BEACON_TX_LO_DBM`. |
 | [bench/pdr_sweep/](bench/pdr_sweep/) | Two-role bench firmware for measuring PDR against TX power on real hardware. |
@@ -218,16 +223,157 @@ Consumers: `WatchFirmware` and `AnchorFirmware` include this as a PlatformIO lib
 ## 8. Build and test
 
 ```sh
-cd tests && make          # builds and runs both roles
+cd tests && make          # builds and runs both roles + the schema check
 make watch                # watch-role only
 make anchor               # anchor-role only
+make schema               # C capture structs vs the Python decoder
+make corpus               # replay every captured session (see §9)
 ```
 
-No hardware, no framework, no network. Currently 1850 watch checks and 70 anchor checks.
+No hardware, no framework, no network.
 
 ---
 
-## 9. Status
+## 9. Capturing real data
+
+The synthetic tests above prove the arithmetic. They cannot prove the arithmetic
+describes a real bedroom — and for a while that gap was doing real damage. The
+§13.4-R2 occlusion fix, for instance, was validated by asserting that occlusion
+is a uniform attenuation and then demonstrating that a uniform attenuation
+cancels, which is close to circular. Real bedding is frequency-dependent (the
+vector mixes 2.4 GHz BLE with 5 GHz WiFi APs), directional, and a near-field
+absorber reshapes the antenna pattern rather than adding flat path loss.
+
+Settling that needs captures from real hardware, replayable against whatever the
+engine looks like later. This section is how.
+
+### The principle: capture inputs, not conclusions
+
+A corpus of **scores** dies the moment the scoring changes — last month's night
+cannot be re-evaluated against this month's engine. A corpus of **inputs**
+replays against every future version forever.
+
+So the record types are arranged around the engine's entry points, not around
+what happened:
+
+| Engine entry point | Record |
+|---|---|
+| `prox_deserialize_vector` | `CAP_VECTOR` — the watch's per-device RSSI list |
+| `prox_ingest_scan_result` | `CAP_ANCHOR_CACHE` — what the anchor itself hears |
+| `prox_load_fingerprint` | `CAP_FINGERPRINT` — replay needs the state it *started* from |
+| `prox_note_motion_*` | `CAP_MOTION`, `CAP_SLEEP` |
+| `prox_obs_note` | `CAP_BEACON` |
+| the clock | every record's `t_ms` / `t_wall` |
+
+Replay is re-issuing those calls in order, which is complete *by construction*:
+if every non-const entry point has a record type, any run can be reproduced.
+**When you add an entry point, add a record.**
+
+Engine *outputs* (`CAP_SCORE`, `CAP_HMM`, `CAP_AWAYGATE`) are captured too, but
+as **assertions, not inputs**. Replay recomputes them and compares; a mismatch is
+either a regression or a change you meant to make. That is what makes the corpus
+a test suite rather than an archive.
+
+This is a separate channel from the serial log. Nothing here replaces a
+`Serial.printf` — that output is prose for a human reading a terminal, and it
+stays as it is.
+
+### Turning it on
+
+`PROX_CAPTURE_ENABLED` (default 1) in
+[src/prox_capture.h](src/prox_capture.h). Off costs nothing: every entry point
+compiles to nothing.
+
+Records are timestamped and buffered on emit, and leave the device only at
+`prox_capture_flush()` — called **after the scan window closes, never during
+one**. On the C3, BLE and WiFi share one radio behind a coex arbiter, so
+transmitting mid-scan drops advertisements, shrinks the scan vector, and
+corrupts the very measurement being captured. Capture that perturbs the
+experiment is worse than none, because the corpus would still look
+authoritative.
+
+> **Unvalidated:** how much the transmit itself costs. Compare vector `n` and
+> `shared` with capture on and off in the same physical setup before trusting a
+> session's device census. This is the spike that should run before anyone
+> builds a dedicated collector.
+
+Transport is one function pointer (`ProxCaptureSink`). Today both firmwares hand
+it a UDP broadcast on port **49001**; swapping in ESP-NOW, a serial framer, or an
+SD card touches nothing else. It is the least important decision here and the
+easiest to defer.
+
+### Recording a session
+
+```sh
+# 1. listen (leave running overnight)
+tools/capture_ingest.py ingest --out corpus/2026-08-04-sunrise.jsonl
+
+# 2. next morning, say what was actually true
+cat > corpus/2026-08-04-sunrise.labels <<'EOF'
+2026-08-04T06:12:00Z 2026-08-04T06:18:00Z  [near] in bed, duvet over the wrist
+2026-08-04T06:18:00Z 2026-08-04T06:40:00Z  [away] kitchen, awake
+EOF
+tools/capture_ingest.py label corpus/2026-08-04-sunrise.jsonl \
+    --from corpus/2026-08-04-sunrise.labels --out corpus/2026-08-04-sunrise.jsonl
+
+# 3. check it is actually usable before trusting it
+tools/capture_ingest.py summary corpus/2026-08-04-sunrise.jsonl
+
+# 4. replay it against the current engine
+cd tests && make corpus
+```
+
+`summary` refuses to call a session ready unless it has provenance, vectors, a
+fingerprint snapshot, and labels. **A corpus without ground truth is a pile of
+numbers** — `[near]` / `[away]` in a label is what the harness scores against,
+and anything it does not recognise is skipped rather than guessed at.
+
+Sessions are archived as JSONL — greppable, diffable, readable in six months by
+someone who has forgotten all of this. `.replay` is a derived artifact,
+regenerable at any time.
+
+### Things that are easy to get wrong, and what stops them
+
+| Risk | Mitigation |
+|---|---|
+| Silent record loss | `seq` advances on every *attempted* emit, so the receiver detects holes from the discontinuity alone and writes an explicit `gap` line. A silently incomplete session is worse than an obviously incomplete one, because it will be trusted. |
+| Corpus mixes two engines | Every session carries `fw_sha` (firmware + engine short SHAs, `+` if the tree was dirty) and `engine_cfg_hash` — an FNV over the constants that change a verdict, *computed* rather than hand-maintained, because a version integer someone must remember to bump is one that goes stale. |
+| Decoder drifts from the wire format | The format is declared twice, in C and in Python. `make schema` compiles a probe and compares every struct size and field count. Drift would not fail loudly; it would mis-decode everything recorded afterwards. |
+| Record types renumbered | `CAP_*` ids are **append-only**. They appear in every corpus file ever written. |
+| Pipeline silently broken | `corpus/synthetic-e2e.jsonl` is a generated session ([tools/make_smoke_session.py](tools/make_smoke_session.py)) that exercises decode → label → export → replay with no hardware. Its `fw_sha` is literally `synthetic`. |
+
+### Reading the replay output
+
+```
+frames 2  agree 2  disagree 0  (mean |drift| 0.0, max 0)
+labelled 2  correct 2  (100%)
+common-mode flagged on 1 frame(s)
+```
+
+Two different questions:
+
+- **agree/disagree** — does today's engine reproduce what the device said at the
+  time? A deliberate scoring change should make *every* frame disagree; the
+  interesting number is the drift. Use `make corpus-drift` when you meant it.
+- **correct** — does today's engine get the *labelled* answer right? This is the
+  one that matters, and it only works on labelled frames.
+
+### Not yet built
+
+- Watch-side replay. The watch captures motion, sleep, HMM ticks and enforcement
+  transitions, but the harness currently replays the **anchor's** Mode A scoring
+  path only. Driving `prox_hmm_tick` from a capture is the natural next step.
+- A dedicated collector. UDP needs an AP in range; ESP-NOW to a third ESP32
+  bridged to a laptop would remove that, and would give one timeline across more
+  than two devices. Do the coex spike first — if capture perturbs the vector,
+  a fancier transport makes it worse, not better. If it happens: do not try to
+  sync clocks, have the collector broadcast a sync beacon and record
+  `(local_ms, sync_seq)` per device, then align offline where mistakes are
+  fixable.
+
+---
+
+## 10. Status
 
 Phase 1 (motion channel, integrator, HMM) and the watch-local parts of Phase 2 (beacon schedule, stepped-power PDR, calibration-v2) are implemented and validated on hardware. Known gaps, all deliberate and recorded in the spec:
 

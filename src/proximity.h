@@ -897,6 +897,17 @@ int             prox_self_levels(int8_t* out_near, int8_t* out_away);
 // Score adjustment the last prox_compute_score() applied, in score units.
 int             prox_last_self_delta(void);
 
+// Read-only walk of the anchor's device registry — the live RF cache and the
+// trained fingerprint, which are two of the engine's inputs and therefore have
+// to be capturable for a run to be reproducible. Index 0..prox_reg_size()-1;
+// slots may be unused, in which case prox_reg_get() returns 0 and writes
+// nothing. Any out-pointer may be NULL.
+int prox_reg_size(void);
+int prox_reg_get(int idx, uint8_t out_mac[6], uint8_t *out_type,
+                 int8_t *out_live_rssi, uint32_t *out_last_seen_ms,
+                 float *out_mu, float *out_var, float *out_W,
+                 uint8_t *out_fp_active);
+
 // §13.4-R2 diagnostics for the last prox_compute_score(). `delta_db` is the
 // estimated common-mode shift (negative = everything got weaker), `mad_db` the
 // median absolute centred residual, `sigma_db` the fingerprint's own mean

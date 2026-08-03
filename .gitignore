@@ -1,1 +1,5 @@
 tests/run_tests
+
+# Host test binaries and Python bytecode
+run_replay
+__pycache__/

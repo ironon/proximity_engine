@@ -504,6 +504,26 @@ int prox_self_levels(int8_t* out_near, int8_t* out_away) {
 }
 int prox_last_self_delta(void) { return g_last_self_delta; }
 
+int prox_reg_size(void) { return g_reg_count; }
+
+int prox_reg_get(int idx, uint8_t out_mac[6], uint8_t *out_type,
+                 int8_t *out_live_rssi, uint32_t *out_last_seen_ms,
+                 float *out_mu, float *out_var, float *out_W,
+                 uint8_t *out_fp_active) {
+    if (idx < 0 || idx >= g_reg_count) return 0;
+    const AnchorDev* d = &g_reg[idx];
+    if (!d->in_use) return 0;
+    if (out_mac)          memcpy(out_mac, d->mac, 6);
+    if (out_type)         *out_type         = d->type;
+    if (out_live_rssi)    *out_live_rssi    = d->live_rssi;
+    if (out_last_seen_ms) *out_last_seen_ms = d->last_seen_ms;
+    if (out_mu)           *out_mu           = d->mu;
+    if (out_var)          *out_var          = d->var;
+    if (out_W)            *out_W            = d->W;
+    if (out_fp_active)    *out_fp_active    = d->fp_active;
+    return 1;
+}
+
 // Bounded, asymmetric score adjustment from the anchor's own beacon level.
 // Linear in dB between the two demonstrated levels, clamped hard at both ends —
 // and clamped TIGHTER on the way down, because a weak reading is what both
