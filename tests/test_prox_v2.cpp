@@ -444,6 +444,124 @@ static int32_t replay_connect_failure(int report, int8_t advert_rssi, int have_a
     return prox_hmm_logodds_q8();
 }
 
+// §13.4-R1 (watch half): the anchor's "I could not measure this" signature —
+// PROX_STARVED_SCORE together with PROX_FLAG_LOW_DEVICE_COUNT — must contribute
+// exactly nothing.
+//
+// Why this needs its own test rather than trusting the neutral score: this
+// engine centres the emission on the anchor's CALIBRATED cutoff, not on 128 as
+// the spec assumed, so a starved score of 128 against a measured cutoff of 188
+// is -1.25 nats of AWAY. Attenuation censors the weakest emitters first, which
+// is the cheapest way to starve the vector, and on getAway an AWAY nudge is a
+// reward. Neutral-in-score-space is not neutral-in-evidence-space.
+static void test_starved_vector_abstains(void) {
+    begin("starved vector: an unmeasurable environment is not evidence of distance");
+
+    const uint8_t kThr = 188;                 // a real measured cutoff
+
+    // Baseline: the same number of ticks with nothing reported at all.
+    prox_hmm_reset(PROX_CRIT_GET_AWAY);
+    feed_still();
+    for (int i = 0; i < 20; ++i) { advance_ms(180000); prox_note_sleep_interval(180000, 0); feed_still(); prox_hmm_tick(NULL); }
+    int32_t quiet = prox_hmm_logodds_q8();
+
+    // Same trace, but every poll returns a starved vector.
+    prox_hmm_reset(PROX_CRIT_GET_AWAY);
+    feed_still();
+    for (int i = 0; i < 20; ++i) {
+        advance_ms(180000); prox_note_sleep_interval(180000, 0); feed_still();
+        ProxScoreResult2 r = mk(PROX_STARVED_SCORE, kThr);
+        r.flags = PROX_FLAG_LOW_DEVICE_COUNT;
+        prox_hmm_tick(&r);
+    }
+    int32_t starved = prox_hmm_logodds_q8();
+
+    CHECK(starved == quiet,
+          "20 starved vectors moved the posterior (%d vs %d with no reading at all)",
+          (int)starved, (int)quiet);
+
+    // The retained score-200 branch must still speak. Attenuation cannot forge a
+    // strong own-anchor RSSI, so near-evidence from a thin vector stays valid
+    // (§13.0) — this is the asymmetry, and deleting it would be a real loss.
+    prox_hmm_reset(PROX_CRIT_GET_AWAY);
+    feed_loco();
+    advance_ms(180000);
+    ProxScoreResult2 near_thin = mk(200, kThr);
+    near_thin.flags = PROX_FLAG_LOW_DEVICE_COUNT;
+    prox_hmm_tick(&near_thin);
+    CHECK(prox_hmm_logodds_q8() > -HMM_PRIOR_Q8,
+          "a thin vector with a strong own-anchor RSSI must still assert NEAR (lam=%d)",
+          (int)prox_hmm_logodds_q8());
+}
+
+// §13.4-R4: connect-failure AWAY evidence requires a motion witness. The
+// argument is physical, not statistical — with no locomotion since the last
+// successful query the distance cannot have changed, so a connect that now fails
+// describes the channel, not the geometry. A wrist under a torso at 30 cm
+// produces exactly this signature.
+static void test_connect_failure_motion_witness(void) {
+    begin("connect-failure needs a motion witness: no locomotion ⇒ no evidence");
+
+    // Still throughout: the rule must contribute nothing whatsoever.
+    prox_hmm_reset(PROX_CRIT_GET_AWAY);
+    feed_still();
+    advance_ms(60000);
+    prox_hmm_tick(NULL);
+    int32_t base = prox_hmm_logodds_q8();
+
+    prox_hmm_reset(PROX_CRIT_GET_AWAY);
+    feed_still();
+    advance_ms(60000);
+    prox_note_connect_failure(-90, 1);
+    prox_hmm_tick(NULL);
+    CHECK(prox_hmm_logodds_q8() == base,
+          "a failed connect on a motionless wrist must contribute 0 (%d vs %d)",
+          (int)prox_hmm_logodds_q8(), (int)base);
+
+    // Once the wrist has demonstrably moved, the same failure is admissible.
+    prox_hmm_reset(PROX_CRIT_GET_AWAY);
+    feed_loco();
+    advance_ms(60000);
+    prox_note_connect_failure(-90, 1);
+    prox_hmm_tick(NULL);
+    int32_t witnessed = prox_hmm_logodds_q8();
+
+    prox_hmm_reset(PROX_CRIT_GET_AWAY);
+    feed_loco();
+    advance_ms(60000);
+    prox_hmm_tick(NULL);
+    int32_t loco_base = prox_hmm_logodds_q8();
+
+    CHECK(witnessed < loco_base,
+          "after locomotion the failed connect must count (%d vs %d)",
+          (int)witnessed, (int)loco_base);
+
+    // A completed query is a fresh position fix, so it retires the witness: a
+    // later failure must re-earn one before it can claim the watch moved away.
+    //
+    // Paired comparison, NOT an absolute one: prox_hmm_tick() advances the
+    // transition model on every call, so the posterior moves even when no
+    // evidence is folded. Only the difference between the two runs isolates the
+    // rule's contribution.
+    begin("connect-failure: a successful query retires the motion witness");
+    int32_t paired[2];
+    for (int report = 0; report < 2; ++report) {
+        prox_hmm_reset(PROX_CRIT_GET_AWAY);
+        feed_loco();
+        advance_ms(60000);
+        ProxScoreResult2 ok = mk(200, 188);
+        prox_hmm_tick(&ok);                    // successful query clears the witness
+        feed_still();
+        advance_ms(60000);
+        if (report) prox_note_connect_failure(-90, 1);
+        prox_hmm_tick(NULL);
+        paired[report] = prox_hmm_logodds_q8();
+    }
+    CHECK(paired[1] == paired[0],
+          "a failure after a successful fix, with no new motion, must contribute 0 "
+          "(%d vs %d)", (int)paired[1], (int)paired[0]);
+}
+
 static void test_connect_failure(void) {
     begin("connect-failure evidence: weak advert ⇒ AWAY log-LR, otherwise abstain");
 
@@ -465,10 +583,17 @@ static void test_connect_failure(void) {
     // full LL_CONNFAIL_AWAY and the posterior marched to saturation on what is
     // one observation repeated — frozen-fade accumulation via the watch-local
     // channel. Watch-local evidence rides the same draw gate as everything else.
+    //
+    // NOTE the deliberate feed_loco() below. §13.4-R4 now gates this rule on a
+    // motion witness, so a wrist that was still for the WHOLE window contributes
+    // nothing and this test would pass vacuously. The case that still needs the
+    // draw gate is the real one: the user walked (earning the witness), then
+    // stopped — after which every repeated failure is the same observation.
     begin("connect-failure evidence does not accumulate while STILL");
     prox_hmm_reset(PROX_CRIT_STAY_NEAR);
-    feed_still();
+    feed_loco();                                 // earn the R4 witness once
     advance_ms(60000);
+    feed_still();
     prox_note_connect_failure(-90, 1);
     prox_hmm_tick(NULL);
     int32_t after_first = prox_hmm_logodds_q8();
@@ -1283,6 +1408,8 @@ int main(void) {
     test_integrator();
     test_decision_layer();
     test_connect_failure();
+    test_connect_failure_motion_witness();
+    test_starved_vector_abstains();
     test_frozen_fade();
     test_walk_approach();
     test_teleport_rejection();

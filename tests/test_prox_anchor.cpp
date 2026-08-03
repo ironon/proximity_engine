@@ -639,6 +639,54 @@ static void test_deferred_calibration(void) {
 
 // ----------------------------------------------------------------------------
 
+// §13.4-R1: "truncation is not distance."
+//
+// The starved-vector branch used to return score 50 — a confident AWAY — from a
+// single raw RSSI comparison. Attenuation censors the weakest emitters first, so
+// smothering the watch is the cheapest possible way to push the vector under
+// PROX_MIN_DEVICE_COUNT, and the branch then bypassed the entire correlation
+// architecture in favour of the one statistic the attack directly defeats. The
+// attack never had to beat Signal A; it only had to starve it. Field vectors
+// already measure 8..31 devices, so the floor sits within one device of normal
+// operation, and a human torso is 15-30 dB.
+static void test_starved_vector_not_away(void) {
+    begin("starved vector: too few devices is an absent measurement, not a far one");
+
+    prox_init();
+    uint8_t self[6]; mk_mac(900, self);
+    prox_set_self_mac(self);
+    for (int i = 0; i < 20; ++i) anchor_hears(i, room_rssi(i));
+
+    // Four devices, none of them the anchor: nothing can be measured.
+    ProxScanVector v; v.count = 0;
+    for (int i = 0; i < 4; ++i) vec_add(&v, i, watch_rssi(i));
+    ProxScoreResult r = prox_compute_score(&v);
+
+    CHECK(r.flags & PROX_FLAG_LOW_DEVICE_COUNT, "the low-count flag must be set");
+    CHECK(r.score == PROX_STARVED_SCORE,
+          "a starved vector must score the criterion-neutral %d, not a confident "
+          "AWAY (got %d)", (int)PROX_STARVED_SCORE, (int)r.score);
+    CHECK(r.score > 50,
+          "regression: the old score-50 branch is back (score=%d)", (int)r.score);
+
+    // The asymmetry that must survive (§13.0): a strong own-anchor RSSI cannot be
+    // manufactured by an attenuating adversary, so near-evidence from a thin
+    // vector is still trustworthy even though far-evidence is not.
+    ProxScanVector n; n.count = 0;
+    for (int i = 0; i < 3; ++i) vec_add(&n, i, watch_rssi(i));
+    if (n.count < PROX_MAX_DEVICES) {
+        memcpy(n.devices[n.count].mac, self, 6);
+        n.devices[n.count].type = PROX_TYPE_BLE;
+        n.devices[n.count].rssi = (int8_t)(ANCHOR_NEAR_RSSI_THRESHOLD_DBM + 10);
+        n.count++;
+    }
+    ProxScoreResult rn = prox_compute_score(&n);
+    CHECK(rn.score == 200,
+          "a thin vector with a strong own-anchor RSSI must still read NEAR "
+          "(got %d) — concluding far needs more evidence than concluding near",
+          (int)rn.score);
+}
+
 int main(void) {
     printf("proximity engine — anchor-side Mode A scoring tests\n\n");
 
@@ -650,6 +698,7 @@ int main(void) {
     test_calib_diagnostics();
     test_self_rssi_term();
     test_calib_fallback_threshold();
+    test_starved_vector_not_away();
 
     printf("\n%d checks, %d failures\n", g_checks, g_fail);
     return g_fail ? 1 : 0;

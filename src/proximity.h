@@ -28,7 +28,26 @@
 // Shadow-then-flip: while PROX_V2_AUTHORITATIVE is 0 the v2 decision is computed
 // and logged beside the shipped v0.8 threshold decision, which stays
 // authoritative. Flip to 1 after the on-hardware shadow-logging check (§10-A P1).
-#define PROX_V2_AUTHORITATIVE                0
+//
+// FLIPPED 2026-07-31 for field trial, after two accepted per-anchor calibrations
+// and with these prerequisites landed together (they are not optional — see the
+// commit that flipped this):
+//   * §13.4-R1 — the starved-vector fallback no longer returns a confident AWAY.
+//     Attenuation censors the weakest emitters first, so smothering the watch
+//     drove count under PROX_MIN_DEVICE_COUNT and bypassed the whole correlation
+//     architecture. On getAway (sunrise lock) that reads as "criterion met".
+//   * §13.4-R4 — connect-failure AWAY evidence now requires a motion witness.
+//   * The donning grace no longer discards its queries: it is the only
+//     LOCOMOTION most windows ever see, and the draw gate makes evidence earned
+//     while still nearly worthless, so throwing it away left the filter unable
+//     to accumulate for the rest of the window.
+//
+// KNOWN LIMITATION, accepted for the trial: on getAway the HMM cold-starts on
+// the criterion-satisfying side and AMBIGUOUS resolves to compliant, so a window
+// that opens on a motionless wrist can take several polls to assert NEAR. That
+// is fail-toward-not-alarming by design (§6.3). Do not ship sunrise lock on this
+// without a backup alarm until the trial says otherwise.
+#define PROX_V2_AUTHORITATIVE                1
 
 // A failed GATT connect plus a recent advertisement at or below this level is
 // strong evidence the watch is FAR (connection establishment fails ~-88 dBm,

@@ -424,7 +424,30 @@ ProxScoreResult prox_compute_score(const ProxScanVector* watch_vec) {
     ProxScoreResult r = { 0, 0 };
     g_last_self_delta = 0;
 
-    // Low-device-count fallback: single raw RSSI comparison to self.
+    // Low-device-count fallback (§13.4-R1 — "truncation is not distance").
+    //
+    // A thin vector used to return 200 or 50 from a single raw RSSI comparison.
+    // The 200 stays; the 50 had to go, and the asymmetry is the whole point.
+    //
+    // Attenuation censors the WEAKEST emitters first, so smothering the watch is
+    // the cheapest way to drive count below PROX_MIN_DEVICE_COUNT — and the old
+    // branch then bypassed the entire correlation architecture in favour of the
+    // one statistic the attack directly defeats, returning a confident AWAY. The
+    // attack never had to beat Signal A; it only had to starve it. Field vectors
+    // already measure 8..31 devices, so the floor sits within one device of
+    // normal operation and a torso is 15-30 dB.
+    //
+    // A truncated vector is an ABSENT measurement, not a far one: return the
+    // criterion-neutral midpoint. NOTE this score is not self-neutralising on
+    // its own — the watch's emission is centred on the anchor's calibrated
+    // cutoff, not on 128 — so the neutral score plus PROX_FLAG_LOW_DEVICE_COUNT
+    // is the signature prox_hmm_tick() abstains on outright. Both halves are
+    // required; changing either one alone reopens the exploit.
+    //
+    // The 200 branch is retained deliberately, per the §13.0 invariant: a strong
+    // own-anchor RSSI cannot be manufactured by an attenuating adversary, so
+    // near-evidence from a thin vector stays trustworthy while far-evidence does
+    // not. Concluding FAR must cost more than concluding NEAR.
     if (watch_vec->count < PROX_MIN_DEVICE_COUNT) {
         r.flags |= PROX_FLAG_LOW_DEVICE_COUNT;
         int8_t self_rssi;
@@ -432,7 +455,7 @@ ProxScoreResult prox_compute_score(const ProxScanVector* watch_vec) {
             && self_rssi >= ANCHOR_NEAR_RSSI_THRESHOLD_DBM)
             r.score = 200;
         else
-            r.score = 50;
+            r.score = PROX_STARVED_SCORE;
         return r;
     }
 
@@ -1383,6 +1406,10 @@ static uint8_t  g_motion_cadence     = 0;   // last burst showed step cadence
 static uint8_t  g_motion_ints        = 0;   // IA1 firings since the last burst
 static uint8_t  g_motion_have_sleep  = 0;   // a sleep interval has been reported
 static uint8_t  g_motion_sleep_still = 0;   // ...and it was motionless
+// §13.4-R4: has LOCOMOTION been observed since the last time we successfully
+// established where we were? Set on any promotion to LOCOMOTION, cleared by a
+// successful query (that IS the fresh position fix) and by the cold start.
+static uint8_t  g_loco_witness       = 0;
 
 static void motion_reset(void) {
     g_motion_state       = PROX_MOTION_UNKNOWN;
@@ -1392,6 +1419,7 @@ static void motion_reset(void) {
     g_motion_ints        = 0;
     g_motion_have_sleep  = 0;
     g_motion_sleep_still = 0;
+    g_loco_witness       = 0;
 }
 
 // Classify from whatever evidence is current (§4.1 table). Order matters: the
@@ -1402,6 +1430,7 @@ static void motion_classify(void) {
     if (g_motion_burst_var > (uint32_t)IMU_LOCO_VAR ||
         g_motion_ints >= IMU_LOCO_MIN_INTS) {
         g_motion_state = PROX_MOTION_LOCOMOTION;
+        g_loco_witness = 1;                     // §13.4-R4
         return;
     }
     // STILL needs *positive* stillness evidence: a quiet burst, no awake IA1
@@ -1473,8 +1502,12 @@ void prox_note_motion_interrupt(void) {
     g_motion_evidence_ms = prox_platform_now_ms();
     // Promote immediately — the wrist demonstrably moved, and waiting for the
     // next burst to say so would leave the HMM locked exactly when it must open.
-    if (g_motion_ints >= IMU_LOCO_MIN_INTS)      g_motion_state = PROX_MOTION_LOCOMOTION;
-    else if (g_motion_state == PROX_MOTION_STILL) g_motion_state = PROX_MOTION_FIDGET;
+    if (g_motion_ints >= IMU_LOCO_MIN_INTS) {
+        g_motion_state = PROX_MOTION_LOCOMOTION;
+        g_loco_witness = 1;                     // §13.4-R4
+    } else if (g_motion_state == PROX_MOTION_STILL) {
+        g_motion_state = PROX_MOTION_FIDGET;
+    }
 }
 
 void prox_note_sleep_interval(uint32_t slept_ms, int motion_woke) {
@@ -1878,8 +1911,18 @@ void prox_note_connect_failure(int8_t last_advert_rssi_dbm, int have_advert) {
     // Advertisement receivable but the link will not close ⇒ far. Without a
     // recent advertisement there is no evidence either way, so abstain rather
     // than guess (the connect could have failed for a dozen local reasons).
-    if (have_advert && last_advert_rssi_dbm <= PROX_FAR_RSSI_THRESHOLD_DBM)
-        g_hmm_local_q8 += LL_CONNFAIL_AWAY_Q8;
+    if (!have_advert || last_advert_rssi_dbm > PROX_FAR_RSSI_THRESHOLD_DBM) return;
+
+    // §13.4-R4: require a motion witness. The justification is physical, not
+    // statistical — with no locomotion since the last successful query the
+    // distance CANNOT have changed, so a connect that now fails is a statement
+    // about the channel, not about geometry. Occlusion (a wrist under a body,
+    // 15-30 dB) reproduces exactly this signature at 30 cm, and it is pure
+    // attacker-controlled input on the one criterion that rewards appearing far.
+    // Zero, not down-weighted: half of a wrong answer is still wrong.
+    if (!g_loco_witness) return;
+
+    g_hmm_local_q8 += LL_CONNFAIL_AWAY_Q8;
 }
 
 // Fold one emission (already in Q8 log-LR, un-weighted) plus any pending
@@ -1959,6 +2002,10 @@ ProxDecision prox_hmm_tick(const ProxScoreResult2* r) {
     // pending (a failed connect is itself an observation) and still advances the
     // transition model.
     if (!r) return hmm_fold(0, 0);
+    // A completed query IS a fresh position fix, so it retires the §13.4-R4
+    // motion witness: any LATER connect failure must be preceded by new
+    // locomotion before it can claim the watch moved away.
+    g_loco_witness = 0;
     // Bounded linear discriminant about the anchor's cutoff (see HMM_EMIT_* in
     // proximity.h for why this is not logit(score/256)).
     //
@@ -1972,6 +2019,27 @@ ProxDecision prox_hmm_tick(const ProxScoreResult2* r) {
     //    evidence. The previous logit-difference form gave -0.1 nats for a score
     //    of 79 while giving +1.2 for a 237, and the filter could not come back.
     uint8_t thr = r->near_thr ? r->near_thr : (uint8_t)PROX_CONFIDENCE_THRESHOLD_U8;
+
+    // §13.4-R1, watch half. A starved vector is an ABSENT measurement and must
+    // contribute exactly nothing.
+    //
+    // The spec assumed PROX_STARVED_SCORE was self-neutralising because its
+    // emission was logit((score+0.5)/256), which is centred on 128. This
+    // implementation deliberately centres on the anchor's CALIBRATED cutoff
+    // instead (see HMM_EMIT_* — calibration-v2 would otherwise be silently
+    // discarded), and that deviation breaks the assumption: against a measured
+    // cutoff of 188 a score of 128 reads as -1.25 nats of AWAY, not 0. Returning
+    // the neutral score therefore softened the starvation exploit without
+    // closing it — an attenuated watch still walks the posterior toward AWAY,
+    // just more slowly, which on getAway is the direction that rewards the user.
+    //
+    // Abstain on the exact signature the anchor emits for "I could not measure
+    // this": the neutral score together with the low-count flag. The score-200
+    // branch is untouched and keeps its near-evidence, per §13.0 — attenuation
+    // cannot manufacture a strong own-anchor RSSI.
+    if ((r->flags & PROX_FLAG_LOW_DEVICE_COUNT) && r->score == PROX_STARVED_SCORE)
+        return hmm_fold(0, 0);
+
     int32_t d   = (int32_t)r->score - (int32_t)thr;
 
     int32_t raw;
