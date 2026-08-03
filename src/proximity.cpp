@@ -1537,6 +1537,96 @@ uint8_t prox_motion_state(void) {
     return g_motion_state;
 }
 
+// ── §13.4-R6: locomotion gate for AWAY ──────────────────────────────────────
+// See proximity.h for what this defends against and why it is keyed on the body
+// rather than on the radio. State is per-window; prox_away_gate_reset() is the
+// only way in.
+static uint8_t  g_awaygate_armed    = 0;
+static uint8_t  g_awaygate_hits     = 0;
+static uint32_t g_awaygate_first_s  = 0;   // first sighting of the current run
+static uint32_t g_awaygate_last_s   = 0;   // most recent counted sighting
+static uint32_t g_awaygate_move_s   = 0;   // last non-STILL observation (liveness)
+
+void prox_away_gate_reset(uint32_t now_s) {
+    g_awaygate_armed   = 0;
+    g_awaygate_hits    = 0;
+    g_awaygate_first_s = 0;
+    g_awaygate_last_s  = 0;
+    // Seed the liveness clock at the reset rather than at zero, so a window that
+    // opens and immediately arms does not inherit a bogus "still since the epoch".
+    g_awaygate_move_s  = now_s;
+}
+
+void prox_away_gate_note(uint32_t now_s, uint8_t motion_state) {
+    // A clock that stepped backwards (NTP landing mid-window) would otherwise
+    // make every elapsed comparison underflow into a huge positive. Treat it as
+    // a reset of the timestamps, keeping the arming decision already earned.
+    if (now_s < g_awaygate_move_s || now_s < g_awaygate_last_s) {
+        g_awaygate_move_s  = now_s;
+        g_awaygate_first_s = now_s;
+        g_awaygate_last_s  = now_s;
+        return;
+    }
+
+    if (motion_state == PROX_MOTION_UNKNOWN) return;   // absence of evidence
+
+    if (motion_state != PROX_MOTION_STILL) g_awaygate_move_s = now_s;
+
+    if (motion_state != PROX_MOTION_LOCOMOTION) return;
+
+    if (g_awaygate_hits == 0) {
+        g_awaygate_hits    = 1;
+        g_awaygate_first_s = now_s;
+        g_awaygate_last_s  = now_s;
+        return;
+    }
+    // Too soon after the last counted sighting: same movement, not a second
+    // independent one.
+    if (now_s - g_awaygate_last_s < (uint32_t)PROX_AWAY_ARM_SPACING_S) return;
+
+    // Outside the window the run is stale — this sighting starts a new one
+    // rather than topping up an old one. Three sightings spread over an hour of
+    // restless sleep must not add up to a walk.
+    if (now_s - g_awaygate_first_s > (uint32_t)PROX_AWAY_ARM_WINDOW_S) {
+        g_awaygate_hits    = 1;
+        g_awaygate_first_s = now_s;
+        g_awaygate_last_s  = now_s;
+        return;
+    }
+
+    if (g_awaygate_hits < 255) g_awaygate_hits++;
+    g_awaygate_last_s = now_s;
+    if (g_awaygate_hits >= PROX_AWAY_ARM_HITS) g_awaygate_armed = 1;
+}
+
+int prox_away_gate_admits(uint32_t now_s) {
+    if (!g_awaygate_armed) return 0;
+    if (now_s >= g_awaygate_move_s &&
+        now_s - g_awaygate_move_s >= (uint32_t)PROX_AWAY_LIVENESS_S) {
+        // Revoke, and clear the run with it: re-arming takes a fresh walk, not
+        // one more twitch on top of a stale count.
+        g_awaygate_armed = 0;
+        g_awaygate_hits  = 0;
+        return 0;
+    }
+    return 1;
+}
+
+uint32_t prox_away_gate_ttl_s(uint32_t now_s) {
+    if (!g_awaygate_armed) return 0;
+    if (now_s < g_awaygate_move_s) return (uint32_t)PROX_AWAY_LIVENESS_S;
+    uint32_t still = now_s - g_awaygate_move_s;
+    if (still >= (uint32_t)PROX_AWAY_LIVENESS_S) return 0;
+    return (uint32_t)PROX_AWAY_LIVENESS_S - still;
+}
+
+void prox_away_gate_state(uint8_t *out_armed, uint8_t *out_hits,
+                          uint32_t *out_last_move_s) {
+    if (out_armed) *out_armed = g_awaygate_armed;
+    if (out_hits)  *out_hits  = g_awaygate_hits;
+    if (out_last_move_s) *out_last_move_s = g_awaygate_move_s;
+}
+
 // Independent draws credited over dt_ms at the current motion state, in Q12.
 // Q12 rather than the public Q4 because the STILL rate is deliberately far below
 // one draw per tick and the remainder has to survive across ticks.

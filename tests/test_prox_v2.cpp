@@ -1398,6 +1398,151 @@ static void test_pdr_tamper(void) {
           "the fresh 4, got %u)", cov_before, cov_after);
 }
 
+// ── §13.4-R6: the locomotion gate for AWAY ─────────────────────────────────
+// Pure state machine on injected wall-clock seconds, so these are exact rather
+// than timing-dependent.
+
+// Walk for `secs` seconds of wall clock, reporting LOCOMOTION every `every_s`.
+static void gate_walk(uint32_t *t, uint32_t secs, uint32_t every_s) {
+    for (uint32_t k = 0; k < secs; k += every_s) {
+        *t += every_s;
+        prox_away_gate_note(*t, PROX_MOTION_LOCOMOTION);
+    }
+}
+
+static void test_away_gate_arming(void) {
+    printf("-- §13.4-R6 away gate: arming --\n");
+    uint32_t t = 1000;
+    prox_away_gate_reset(t);
+
+    CHECK(prox_away_gate_admits(t) == 0, "a fresh window starts disarmed");
+
+    // The attack: lying still under a pillow. No locomotion, ever.
+    for (int i = 0; i < 40; i++) {
+        t += 30;
+        prox_away_gate_note(t, PROX_MOTION_STILL);
+    }
+    CHECK(prox_away_gate_admits(t) == 0,
+          "20 minutes of stillness never arms the gate");
+
+    // Fidgeting is not walking. It feeds liveness but must not arm.
+    for (int i = 0; i < 20; i++) {
+        t += 10;
+        prox_away_gate_note(t, PROX_MOTION_FIDGET);
+    }
+    CHECK(prox_away_gate_admits(t) == 0, "fidgeting alone never arms the gate");
+
+    // Actually getting up: ~15 s of walking with the interrupt path re-checking.
+    gate_walk(&t, 20, PROX_AWAY_ARM_SPACING_S);
+    CHECK(prox_away_gate_admits(t) == 1, "a short walk arms the gate");
+}
+
+static void test_away_gate_independence(void) {
+    printf("-- §13.4-R6 away gate: sighting independence --\n");
+
+    // One brief burst of movement, however many times it is re-reported, is ONE
+    // sighting: a roll-over in bed lasts a couple of seconds and must not be
+    // able to supply a whole walk's worth of evidence on its own.
+    uint32_t t = 1000;
+    prox_away_gate_reset(t);
+    for (uint32_t k = 0; k < (uint32_t)PROX_AWAY_ARM_SPACING_S; k++) {
+        t += 1;
+        prox_away_gate_note(t, PROX_MOTION_LOCOMOTION);
+    }
+    uint8_t hits = 0;
+    prox_away_gate_state(nullptr, &hits, nullptr);
+    CHECK(hits == 1, "a burst shorter than the spacing counts as one sighting");
+    CHECK(prox_away_gate_admits(t) == 0, "...and one sighting does not arm");
+
+    // Isolated sightings scattered across a long window are also not a walk —
+    // this is the restless sleeper who turns over every few minutes.
+    t = 1000;
+    prox_away_gate_reset(t);
+    for (int i = 0; i < 10; i++) {
+        t += (uint32_t)PROX_AWAY_ARM_WINDOW_S + 30;
+        prox_away_gate_note(t, PROX_MOTION_LOCOMOTION);
+    }
+    CHECK(prox_away_gate_admits(t) == 0,
+          "sightings spread wider than the arming window never accumulate");
+}
+
+static void test_away_gate_unknown_never_arms(void) {
+    printf("-- §13.4-R6 away gate: UNKNOWN is not evidence --\n");
+    // Everywhere else a stale motion channel is treated as LOCOMOTION. Here that
+    // would let a silent IMU arm the gate on nothing at all, which inverts the
+    // whole defence.
+    uint32_t t = 1000;
+    prox_away_gate_reset(t);
+    for (int i = 0; i < 50; i++) {
+        t += 10;
+        prox_away_gate_note(t, PROX_MOTION_UNKNOWN);
+    }
+    CHECK(prox_away_gate_admits(t) == 0, "UNKNOWN motion never arms the gate");
+}
+
+static void test_away_gate_liveness(void) {
+    printf("-- §13.4-R6 away gate: liveness --\n");
+    uint32_t t = 1000;
+    prox_away_gate_reset(t);
+    gate_walk(&t, 20, PROX_AWAY_ARM_SPACING_S);
+    CHECK(prox_away_gate_admits(t) == 1, "armed after the walk");
+
+    // Got up, walked out, sat down at a desk. Fidgeting keeps it alive — this is
+    // the compliant user the one-minute rule would have punished.
+    for (int i = 0; i < 60; i++) {
+        t += 30;
+        prox_away_gate_note(t, PROX_MOTION_FIDGET);
+        CHECK(prox_away_gate_admits(t) == 1, "fidgeting sustains the arming");
+    }
+
+    // Now back to bed: stillness, and only stillness.
+    uint32_t bed = t;
+    while (t < bed + (uint32_t)PROX_AWAY_LIVENESS_S - 10) {
+        t += 10;
+        prox_away_gate_note(t, PROX_MOTION_STILL);
+    }
+    CHECK(prox_away_gate_admits(t) == 1,
+          "stillness short of the timeout does not revoke");
+    CHECK(prox_away_gate_ttl_s(t) > 0 &&
+          prox_away_gate_ttl_s(t) <= (uint32_t)PROX_AWAY_LIVENESS_S,
+          "ttl counts down toward the revocation");
+
+    t = bed + (uint32_t)PROX_AWAY_LIVENESS_S;
+    prox_away_gate_note(t, PROX_MOTION_STILL);
+    CHECK(prox_away_gate_admits(t) == 0,
+          "sustained stillness revokes the arming");
+    CHECK(prox_away_gate_ttl_s(t) == 0, "ttl is zero once revoked");
+
+    // Revocation clears the run: re-arming takes a fresh walk, not one twitch.
+    t += 10;
+    prox_away_gate_note(t, PROX_MOTION_LOCOMOTION);
+    CHECK(prox_away_gate_admits(t) == 0, "one sighting does not re-arm");
+    gate_walk(&t, 20, PROX_AWAY_ARM_SPACING_S);
+    CHECK(prox_away_gate_admits(t) == 1, "a fresh walk re-arms");
+}
+
+static void test_away_gate_clock_step(void) {
+    printf("-- §13.4-R6 away gate: clock steps --\n");
+    // An NTP correction landing mid-window must not read as elapsed time, in
+    // either direction. Backwards is the dangerous one: unsigned subtraction
+    // would underflow into a huge "still for 4 billion seconds" and revoke.
+    uint32_t t = 100000;
+    prox_away_gate_reset(t);
+    gate_walk(&t, 20, PROX_AWAY_ARM_SPACING_S);
+    CHECK(prox_away_gate_admits(t) == 1, "armed before the step");
+
+    uint32_t back = t - 5000;                 // clock jumps backwards
+    prox_away_gate_note(back, PROX_MOTION_STILL);
+    CHECK(prox_away_gate_admits(back) == 1,
+          "a backwards clock step does not revoke the arming");
+
+    // And it still revokes normally once real time passes afterwards.
+    uint32_t later = back + (uint32_t)PROX_AWAY_LIVENESS_S + 1;
+    prox_away_gate_note(later, PROX_MOTION_STILL);
+    CHECK(prox_away_gate_admits(later) == 0,
+          "revocation still works after the step");
+}
+
 int main(void) {
     printf("proximity engine v2.1 — Phase 1 acceptance tests\n\n");
 
@@ -1424,6 +1569,11 @@ int main(void) {
     test_pdr_schedule_disabled();
     test_pdr_loglr();
     test_pdr_tamper();
+    test_away_gate_arming();
+    test_away_gate_independence();
+    test_away_gate_unknown_never_arms();
+    test_away_gate_liveness();
+    test_away_gate_clock_step();
 
     printf("\n%d checks, %d failures\n", g_checks, g_fail);
     return g_fail ? 1 : 0;

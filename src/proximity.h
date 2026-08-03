@@ -42,11 +42,21 @@
 //     while still nearly worthless, so throwing it away left the filter unable
 //     to accumulate for the rest of the window.
 //
-// KNOWN LIMITATION, accepted for the trial: on getAway the HMM cold-starts on
-// the criterion-satisfying side and AMBIGUOUS resolves to compliant, so a window
-// that opens on a motionless wrist can take several polls to assert NEAR. That
-// is fail-toward-not-alarming by design (§6.3). Do not ship sunrise lock on this
-// without a backup alarm until the trial says otherwise.
+//   * §13.4-R6 (added 2026-08-03) — an AWAY verdict on getAway must be
+//     corroborated by witnessed locomotion. See PROX_AWAY_ARM_HITS below.
+//
+// The limitation previously recorded here — that getAway cold-starts on the
+// criterion-satisfying side and resolved AMBIGUOUS to compliant, so a window
+// opening on a motionless wrist read as met — is closed by R6 rather than by
+// changing §6.3. The cold start still leans toward AWAY, and AMBIGUOUS still
+// does not assert NEAR; what changed is that neither is admissible on its own
+// any more. A motionless wrist cannot satisfy getAway however the RF reads.
+//
+// STILL OPEN, and the reason R6 is explicitly interim: §13.4-R2. Signal B
+// scores absolute dBm, so uniform attenuation reads as displacement, and the
+// blend hands B more authority as training matures — a better calibration makes
+// the occlusion attack easier, not harder. R6 defends the verdict; R2 would fix
+// the measurement. Sunrise lock still wants a backup alarm until R2 lands.
 #define PROX_V2_AUTHORITATIVE                1
 
 // A failed GATT connect plus a recent advertisement at or below this level is
@@ -307,6 +317,49 @@
 // Criterion-neutral score returned when no signal has enough data. NOT 0: an
 // absent measurement is not evidence of distance, and 0 reads as confident AWAY.
 #define PROX_STARVED_SCORE                   128
+
+// ── §13.4-R6: locomotion corroboration for AWAY (the "you can't teleport" gate)
+//
+// Interim defence for sunrise lock, standing in for R2 until Signal B is made
+// offset-invariant. The attack it answers: a pillow or duvet over the wrist
+// attenuates every device in the vector by roughly the same amount, which
+// Signal A (Pearson, affine-invariant) shrugs off but Signal B (a Gaussian on
+// ABSOLUTE dBm) reads as "somewhere else" — and the blend hands authority to B
+// as the fingerprint matures. A better calibration therefore makes this attack
+// EASIER, which is why no amount of recalibrating has fixed it.
+//
+// The gate sidesteps the RF argument entirely. getAway asserts "the user left
+// the room", and the physical precondition for that is walking: you cannot be
+// away from where you were sleeping without having moved there, and a person
+// who genuinely got up keeps producing locomotion. A wrist under a pillow
+// produces none. So the verdict is corroborated against the body rather than
+// against the radio, and no occlusion detector is needed.
+//
+// Deliberately one-directional (§13.0): it can only make AWAY harder to
+// conclude, never NEAR. It can never silence an alarm, only keep one ringing.
+//
+// ARMING. AWAY is inadmissible until PROX_AWAY_ARM_HITS locomotion sightings
+// have landed, each at least PROX_AWAY_ARM_SPACING_S apart, all inside
+// PROX_AWAY_ARM_WINDOW_S. The spacing is what makes the sightings independent —
+// a single roll-over is one event and cannot supply three. The window is what
+// makes them a WALK rather than a scattering: a restless sleeper accumulates
+// isolated sightings across a long window, but never three inside a minute.
+// With MINIMUM_BLE_DELAY_ENFORCEMENT at 3 s the interrupt path re-checks every
+// ~3 s while walking, so genuinely getting up arms this in ~15 s.
+#define PROX_AWAY_ARM_HITS                   3
+#define PROX_AWAY_ARM_SPACING_S              5
+#define PROX_AWAY_ARM_WINDOW_S               60
+
+// LIVENESS. Once armed, a continuous stretch of STILL this long revokes it.
+// This closes what arming alone leaves open: get up, walk out, come back to bed
+// under the covers with the engine still reporting AWAY. Deliberately NOT keyed
+// on locomotion — someone who got up and sat down at a desk produces no
+// locomotion for half an hour and is entirely compliant, so the test is
+// non-STILL (FIDGET counts), which an awake body produces constantly and a
+// sleeping one does not. Five minutes rather than the one minute first proposed:
+// a minute of stillness is ordinary for an awake person, and the cost of getting
+// it wrong is an alarm restarting on someone who obeyed.
+#define PROX_AWAY_LIVENESS_S                 300
 #define PROX_MIN_MTU_BYTES                   256
 #define PROX_CONFIDENCE_THRESHOLD_U8         170
 #define PROX_MISSING_RSSI_DBM                (-100)
@@ -870,6 +923,40 @@ uint8_t  prox_motion_burst_cadence(void);
 // Path-length proxy s_IMU expressed as the Q4 N_eff credit accrued over dt_ms
 // at the current motion state (§4.1).
 uint16_t prox_motion_neff_credit_q4(uint32_t dt_ms);
+
+// ── §13.4-R6 locomotion gate (see the constants above) ──────────────────────
+//
+// Takes wall-clock seconds from the caller rather than reading a clock, both so
+// it is testable and because it must survive light sleep — the watch backs its
+// enforcement poll off to minutes and the millisecond clock is not the thing to
+// trust across that. Steps backwards (an NTP correction mid-window) are treated
+// as a clock reset rather than as elapsed time.
+
+// Call when a getAway window opens. Disarmed, no sightings, liveness clock
+// starts now.
+void prox_away_gate_reset(uint32_t now_s);
+
+// Feed one motion observation, taken from prox_motion_state(). Call after each
+// query, when the burst is fresh.
+//
+// UNKNOWN is ignored outright. Everywhere else in the engine a stale motion
+// channel is treated as LOCOMOTION (fail toward v0.8 behaviour), but here that
+// would let an IMU that has simply gone quiet arm the gate on no evidence at
+// all — the exact inversion this defence exists to prevent. Arming requires
+// POSITIVE locomotion.
+void prox_away_gate_note(uint32_t now_s, uint8_t motion_state);
+
+// 1 if an AWAY verdict may currently be believed. Evaluates the liveness
+// timeout, so calling it is what revokes a stale arming.
+int prox_away_gate_admits(uint32_t now_s);
+
+// Seconds until liveness revokes the arming, or 0 if not armed / already due.
+// Lets the caller cap a light sleep so revocation is not slept through.
+uint32_t prox_away_gate_ttl_s(uint32_t now_s);
+
+// Diagnostics for the [AWAYGATE] log line. Any out-pointer may be NULL.
+void prox_away_gate_state(uint8_t *out_armed, uint8_t *out_hits,
+                          uint32_t *out_last_move_s);
 
 // Integrator (§4.2). update() reads the clock and motion state itself.
 void     prox_integ_reset(ProxIntegrator* it);
