@@ -403,6 +403,62 @@
 // the score down toward the middle.
 #define PROX_LL_CENTER                       (-1.5f)
 #define PROX_LL_SCALE                        1.5f
+
+// ── §13.4-R2: offset-invariant Signal B ─────────────────────────────────────
+//
+// THE BUG. Signal B scored ABSOLUTE dBm: dx = x - mu, penalty dx^2/2sigma^2.
+// Occlusion is a COMMON-MODE shift — a duvet attenuates every emitter in the
+// vector by roughly the same delta — so every dx moves together by -delta while
+// the watch has not travelled a centimetre. At a typical sigma of 6 dB a 12 dB
+// blanket puts EVERY device at exactly 2 sigma, mean log-lik -2.0, which is the
+// same number a genuine room change produces. Signal B could not tell them
+// apart, by construction.
+//
+// Signal A (Pearson) is immune, being affine-invariant. But alpha =
+// exp(-W_total/PROX_ALPHA_W0) decays as the fingerprint trains, handing
+// authority FROM the occlusion-proof signal TO the occlusion-vulnerable one.
+// That is why calibrating harder made sunrise lock easier to cheat: it was
+// reinforcing the exploitable half of the blend.
+//
+// THE FIX. Estimate the common-mode shift from the vector itself and remove it
+// before scoring: delta = median(x_i - mu_i), and score the CENTRED residual
+// c_i = (x_i - mu_i) - delta. A uniform attenuation cancels exactly. A genuine
+// move does not, because displacement is DIFFERENTIAL — leaving the room
+// changes near emitters a lot and distant ones little, so the residuals survive
+// the subtraction.
+//
+// The median, not the mean: a handful of emitters that genuinely changed (a
+// phone that left with you) must not drag the estimate, and the median tolerates
+// up to half the vector doing something else.
+//
+// NOTHING PERSISTED CHANGES. mu/sigma stay in absolute dBm and the NVS and app
+// blob formats are byte-identical. Delta is estimated per query, at score time.
+// No retraining, no schema migration.
+//
+// WHAT IT COSTS. Genuine distance also has a common-mode component, so removing
+// it makes Signal B a pure shape matcher and gives up some far-evidence. The
+// resulting failure mode is "slower to assert AWAY", which is the direction
+// §13.0 demands — an attenuating adversary must never find concluding FAR
+// cheap. Signal A carries the rest.
+//
+// RECALIBRATION REQUIRED. near_thr is a per-anchor cutoff in SCORE space, and
+// this moves the score distribution underneath it. Every calibration predating
+// this flip must be redone.
+#define PROX_R2_OFFSET_INVARIANT             1
+
+// Minimum residuals needed before a common-mode estimate means anything. Below
+// this the median is noise and the term falls back to the legacy absolute
+// scoring rather than subtracting a made-up offset.
+#define PROX_CM_MIN_SAMPLES                  6
+
+// Diagnostic-only occlusion signature: a large common-mode shift with the shape
+// still intact. PROVISIONAL — these two thresholds are the only numbers here not
+// derived from something measured, and nothing acts on the flag. It exists so a
+// field log can say "this is what a duvet looks like" before any decision is
+// wired to it. mad_ratio compares against the fingerprint's own trained
+// dispersion rather than an absolute dB figure, so it self-scales per anchor.
+#define PROX_CM_OCCLUSION_DB                 8.0f
+#define PROX_CM_MAD_RATIO                    1.0f
 #define PROX_COLLECT_SCORE_THRESHOLD         0.75f
 #define PROX_COLLECT_AMBIGUITY_MARGIN_DBM    10
 #define PROX_NVS_PERSIST_INTERVAL_S          300
@@ -546,6 +602,10 @@
 // was folded into the fingerprint (§4.10.4). Lets a calibration burst count
 // samples that actually taught the anchor, rather than mere elapsed time.
 #define PROX_FLAG_SAMPLE_ACCEPTED     0x04u
+// §13.4-R2 diagnostic: the vector shifted as a block while keeping its shape —
+// the signature of something between the watch and the world rather than of the
+// watch having moved. Nothing acts on this yet; see PROX_CM_OCCLUSION_DB.
+#define PROX_FLAG_COMMON_MODE         0x08u
 
 // ============================================================================
 // Shared data structures
@@ -836,6 +896,16 @@ int             prox_calib_last_stats(ProxCalibStats* out);
 int             prox_self_levels(int8_t* out_near, int8_t* out_away);
 // Score adjustment the last prox_compute_score() applied, in score units.
 int             prox_last_self_delta(void);
+
+// §13.4-R2 diagnostics for the last prox_compute_score(). `delta_db` is the
+// estimated common-mode shift (negative = everything got weaker), `mad_db` the
+// median absolute centred residual, `sigma_db` the fingerprint's own mean
+// trained dispersion for the devices that took part, and `n` how many there
+// were. `legacy_L`/`invariant_L` are Signal B scored both ways, so a field log
+// can show what the flip actually changed on real vectors. Any pointer may be
+// NULL. Valid only until the next score.
+void prox_last_common_mode(float *delta_db, float *mad_db, float *sigma_db,
+                           int *n, float *legacy_L, float *invariant_L);
 // Per-anchor decision threshold in score space (0 = uncalibrated → use global
 // PROX_CONFIDENCE_THRESHOLD_U8). Persisted alongside the fingerprint NVS blob.
 void            prox_set_near_threshold(uint8_t thr);

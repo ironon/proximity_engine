@@ -687,6 +687,233 @@ static void test_starved_vector_not_away(void) {
           (int)rn.score);
 }
 
+// ── §13.4-R2: offset-invariant Signal B ─────────────────────────────────────
+//
+// The defect these pin: Signal B scored ABSOLUTE dBm, so a duvet — which
+// attenuates every emitter by roughly the same amount — was arithmetically
+// indistinguishable from having walked out of the room. Worse, alpha hands
+// Signal B more authority as the fingerprint matures, so training the anchor
+// made the attack EASIER. These tests train hard first, precisely because that
+// is the regime where the old code failed worst.
+
+// A fresh observation of the same spot: the trained mean plus per-device noise.
+// Scoring the exact mean makes every residual identical and the dispersion
+// measures degenerate, which would flatter the common-mode estimator.
+static void vec_jitter(ProxScanVector* v, int seed) {
+    for (int i = 0; i < v->count; ++i) {
+        const int n = ((i * 11 + seed * 5) % 7) - 3;      // deterministic +/-3 dB
+        v->devices[i].rssi = (int8_t)(v->devices[i].rssi + n);
+    }
+}
+
+// Everything the watch hears, attenuated by `db`. What a blanket does.
+static void vec_attenuate(ProxScanVector* v, int db) {
+    for (int i = 0; i < v->count; ++i) {
+        int r = (int)v->devices[i].rssi - db;
+        if (r < -120) r = -120;
+        v->devices[i].rssi = (int8_t)r;
+    }
+}
+
+// Train on the NEAR spot with per-sample jitter, so the fingerprint ends up with
+// a realistic width. Training on a byte-identical vector collapses sigma toward
+// the floor, and a common-mode test run against a zero-width fingerprint proves
+// much less than it appears to — every threshold here is relative to sigma.
+static void train_near(ProxScanVector* nv, int samples) {
+    for (int s = 0; s < samples; ++s) {
+        ProxScanVector j = *nv;
+        for (int i = 0; i < j.count; ++i) {
+            const int n = ((i * 7 + s * 13) % 9) - 4;      // deterministic +/-4 dB
+            j.devices[i].rssi = (int8_t)(j.devices[i].rssi + n);
+        }
+        prox_train_labeled(&j, 1);
+    }
+}
+
+static void test_r2_uniform_attenuation(void) {
+    begin("R2: a uniform attenuation does not move the score");
+    prox_init();
+    for (int i = 0; i < 60; ++i) anchor_hears(i, room_rssi(i));
+
+    ProxScanVector nv; nv.count = 0;
+    for (int i = 0; i < 31; ++i) vec_add(&nv, i, watch_rssi(i));
+    train_near(&nv, 128);          // mature fingerprint: alpha now favours B
+
+    ProxScanVector obs = nv;
+    vec_jitter(&obs, 3);
+    const int clear = prox_compute_score(&obs).score;
+    {
+        float mad0 = 0, sigma0 = 0;
+        prox_last_common_mode(NULL, &mad0, &sigma0, NULL, NULL, NULL);
+        printf("    unattenuated baseline: score %d, mad %.1f, sigma %.1f\n",
+               clear, mad0, sigma0);
+        CHECK(mad0 > 0.0f, "the baseline must have real dispersion to compare against");
+    }
+
+    // The attack, at three strengths. A torso is 15-30 dB; a duvet less.
+    const int levels[] = {8, 12, 20};
+    for (int k = 0; k < 3; ++k) {
+        ProxScanVector av = obs;
+        vec_attenuate(&av, levels[k]);
+        const int covered = prox_compute_score(&av).score;
+
+        float delta = 0, mad = 0, sigma = 0, legacy = 0, invariant = 0;
+        int n = 0;
+        prox_last_common_mode(&delta, &mad, &sigma, &n, &legacy, &invariant);
+
+        printf("    -%2d dB: score %d -> %d | delta %+.1f mad %.1f sigma %.1f "
+               "| L legacy %.2f invariant %.2f\n",
+               levels[k], clear, covered, delta, mad, sigma, legacy, invariant);
+
+        CHECK(delta < -(float)levels[k] + 3.0f && delta > -(float)levels[k] - 3.0f,
+              "the common-mode estimate should recover the attenuation "
+              "(-%d dB), got %+.1f", levels[k], delta);
+        CHECK(covered > clear - 25,
+              "a %d dB blanket must not move the score (%d -> %d)",
+              levels[k], clear, covered);
+        CHECK(invariant > legacy + 0.05f,
+              "the invariant scoring must beat the legacy one under attenuation "
+              "(legacy %.2f, invariant %.2f)", legacy, invariant);
+    }
+}
+
+static void test_r2_differential_still_reads_far(void) {
+    begin("R2: removing the common mode does not blind the score to real moves");
+    // The risk of the fix: subtract too much and everything reads NEAR forever.
+    // A genuine displacement changes emitters by DIFFERENT amounts, so it must
+    // survive the subtraction.
+    prox_init();
+    for (int i = 0; i < 60; ++i) anchor_hears(i, room_rssi(i));
+
+    ProxScanVector nv; nv.count = 0;
+    for (int i = 0; i < 31; ++i) vec_add(&nv, i, watch_rssi(i));
+    train_near(&nv, 128);
+    const int near_score = prox_compute_score(&nv).score;
+
+    ProxScanVector fv; fv.count = 0;
+    for (int i = 0; i < 31; ++i) vec_add(&fv, i, far_rssi(i));
+    const int far_score = prox_compute_score(&fv).score;
+
+    float delta = 0, mad = 0, sigma = 0;
+    int n = 0;
+    prox_last_common_mode(&delta, &mad, &sigma, &n, NULL, NULL);
+    printf("    NEAR %d | FAR %d (gap %d) | far vector: delta %+.1f mad %.1f "
+           "sigma %.1f\n", near_score, far_score, near_score - far_score,
+           delta, mad, sigma);
+
+    CHECK(far_score < near_score - 40,
+          "a genuinely different place must still score far below NEAR "
+          "(near %d, far %d)", near_score, far_score);
+    CHECK(mad > sigma,
+          "displacement must leave residual dispersion above the trained width "
+          "(mad %.1f, sigma %.1f)", mad, sigma);
+}
+
+static void test_r2_median_resists_a_minority(void) {
+    begin("R2: a few devices that really changed do not drag the estimate");
+    // Why the median and not the mean: your phone leaving the room with you is a
+    // handful of devices changing hugely while the rest are unchanged. The
+    // common-mode estimate must describe the ROOM, not the outliers.
+    prox_init();
+    for (int i = 0; i < 60; ++i) anchor_hears(i, room_rssi(i));
+
+    ProxScanVector nv; nv.count = 0;
+    for (int i = 0; i < 31; ++i) vec_add(&nv, i, watch_rssi(i));
+    train_near(&nv, 128);
+
+    ProxScanVector mv = nv;
+    for (int i = 0; i < 5; ++i) mv.devices[i].rssi = (int8_t)-110;   // 5 of 31
+
+    prox_compute_score(&mv);
+    float delta = 0;
+    prox_last_common_mode(&delta, NULL, NULL, NULL, NULL, NULL);
+    printf("    5 of 31 devices collapsed: delta %+.1f\n", delta);
+    CHECK(delta > -4.0f && delta < 4.0f,
+          "a minority of changed devices must not move the common-mode estimate, "
+          "got %+.1f", delta);
+}
+
+static void test_r2_common_mode_flag(void) {
+    begin("R2: the occlusion signature is flagged, displacement is not");
+    prox_init();
+    for (int i = 0; i < 60; ++i) anchor_hears(i, room_rssi(i));
+
+    ProxScanVector nv; nv.count = 0;
+    for (int i = 0; i < 31; ++i) vec_add(&nv, i, watch_rssi(i));
+    train_near(&nv, 128);
+
+    ProxScanVector obs = nv;
+    vec_jitter(&obs, 3);
+    CHECK((prox_compute_score(&obs).flags & PROX_FLAG_COMMON_MODE) == 0,
+          "an unchanged vector must not be flagged");
+
+    ProxScanVector av = obs;
+    vec_attenuate(&av, 15);
+    CHECK((prox_compute_score(&av).flags & PROX_FLAG_COMMON_MODE) != 0,
+          "a 15 dB block shift with the shape intact is the occlusion signature");
+
+    ProxScanVector fv; fv.count = 0;
+    for (int i = 0; i < 31; ++i) vec_add(&fv, i, far_rssi(i));
+    CHECK((prox_compute_score(&fv).flags & PROX_FLAG_COMMON_MODE) == 0,
+          "a genuine displacement must not be flagged as occlusion");
+}
+
+static void test_r2_self_rssi_correction(void) {
+    begin("R2: the anchor's own beacon is corrected for the common mode");
+    // The self term is the strongest near/far discriminator the anchor has, and
+    // a duvet attenuates it exactly like everything else. With the common-mode
+    // shift known, the part of a weak reading that the whole room also suffered
+    // is walked back — so bedding no longer buys far-evidence from this term.
+    prox_init();
+    set_self_mac();
+    for (int i = 0; i < 40; ++i) anchor_hears(i, room_rssi(i));
+    anchor_hears(SELF_IDX, -40);
+
+    prox_calib_reset();
+    for (int i = 0; i < 12; ++i) calib_sample(1, (int8_t)(-80 + (i % 3) - 1));
+    for (int i = 0; i < 10; ++i) calib_sample(0, (int8_t)(-92 + (i % 3) - 1));
+    prox_calib_finalize(NULL, NULL, NULL);
+
+    ProxScanVector nv; nv.count = 0;
+    for (int i = 0; i < 28; ++i) vec_add(&nv, i, watch_rssi(i));
+    vec_add(&nv, SELF_IDX, -80);              // demonstrated NEAR level
+    train_near(&nv, 64);
+    prox_compute_score(&nv);
+    const int d_clear = prox_last_self_delta();
+
+    // Same spot, under a blanket: the whole vector including the anchor's own
+    // beacon drops 12 dB, which lands the self reading on the demonstrated AWAY
+    // level. Uncorrected this is a confident vote for FAR.
+    ProxScanVector cv = nv;
+    vec_attenuate(&cv, 12);
+    prox_compute_score(&cv);
+    const int d_covered = prox_last_self_delta();
+
+    printf("    self delta: clear %+d, under 12 dB blanket %+d\n",
+           d_clear, d_covered);
+    CHECK(d_covered >= 0,
+          "a blanket must not turn the self term into far-evidence, got %+d",
+          d_covered);
+
+    begin("R2: the self correction is one-directional");
+    // §13.0. A NEGATIVE common mode is walked back, because that is what an
+    // attenuating adversary manufactures. A POSITIVE one must not be, because
+    // walking that back would make concluding FAR cheaper — and concluding FAR
+    // must never get cheaper.
+    ProxScanVector uv = nv;
+    vec_attenuate(&uv, -10);                  // everything 10 dB STRONGER
+    prox_compute_score(&uv);
+    float delta_up = 0;
+    prox_last_common_mode(&delta_up, NULL, NULL, NULL, NULL, NULL);
+    const int d_up = prox_last_self_delta();
+    printf("    everything +10 dB: delta %+.1f, self term %+d (clear was %+d)\n",
+           delta_up, d_up, d_clear);
+    CHECK(delta_up > 6.0f, "the estimate should see the +10 dB, got %+.1f", delta_up);
+    CHECK(d_up >= d_clear,
+          "a positive common mode must not be subtracted away (%+d vs clear %+d)",
+          d_up, d_clear);
+}
+
 int main(void) {
     printf("proximity engine — anchor-side Mode A scoring tests\n\n");
 
@@ -699,6 +926,11 @@ int main(void) {
     test_self_rssi_term();
     test_calib_fallback_threshold();
     test_starved_vector_not_away();
+    test_r2_uniform_attenuation();
+    test_r2_differential_still_reads_far();
+    test_r2_median_resists_a_minority();
+    test_r2_common_mode_flag();
+    test_r2_self_rssi_correction();
 
     printf("\n%d checks, %d failures\n", g_checks, g_fail);
     return g_fail ? 1 : 0;

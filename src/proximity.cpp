@@ -310,13 +310,67 @@ static int signal_correlation(const ProxScanVector* v, float* out_rho, int* out_
     return 1;
 }
 
+// §13.4-R2 working set for one score: the per-device residual against the
+// fingerprint, and the weight the Gaussian gives it. File-static rather than on
+// the stack because the registry holds up to 128 devices and the engine is
+// single-threaded by construction (see the platform-seam note at the top).
+static float g_cm_resid[ANCHOR_PROX_MAX_FINGERPRINT_DEVICES];
+static float g_cm_inv2var[ANCHOR_PROX_MAX_FINGERPRINT_DEVICES];
+static float g_cm_scratch[ANCHOR_PROX_MAX_FINGERPRINT_DEVICES];
+
+// §13.4-R2 diagnostics for the last score.
+static float g_cm_delta   = 0.0f;
+static float g_cm_mad     = 0.0f;
+static float g_cm_sigma   = 0.0f;
+static int   g_cm_n       = 0;
+static float g_cm_legacy_L    = 0.0f;
+static float g_cm_invariant_L = 0.0f;
+
+void prox_last_common_mode(float *delta_db, float *mad_db, float *sigma_db,
+                           int *n, float *legacy_L, float *invariant_L) {
+    if (delta_db)    *delta_db    = g_cm_delta;
+    if (mad_db)      *mad_db      = g_cm_mad;
+    if (sigma_db)    *sigma_db    = g_cm_sigma;
+    if (n)           *n           = g_cm_n;
+    if (legacy_L)    *legacy_L    = g_cm_legacy_L;
+    if (invariant_L) *invariant_L = g_cm_invariant_L;
+}
+
+// Median of `n` floats, destroying `a`. Insertion sort: n is at most the
+// registry size and this runs once per query, so the O(n^2) is irrelevant next
+// to the BLE scan that produced the vector.
+static float median_f(float* a, int n) {
+    if (n <= 0) return 0.0f;
+    for (int i = 1; i < n; ++i) {
+        float key = a[i];
+        int j = i - 1;
+        while (j >= 0 && a[j] > key) { a[j + 1] = a[j]; --j; }
+        a[j + 1] = key;
+    }
+    // Even n takes the lower of the two central values rather than their mean.
+    // The estimate feeds a subtraction that must not invent a level no emitter
+    // actually reported.
+    return a[(n - 1) / 2];
+}
+
 // Signal B: Gaussian Naive Bayes likelihood of the vector under the fingerprint.
 // Returns L in [0,1] via logistic on average per-device log-likelihood; out_wtot
 // receives the total fingerprint weight (drives the blend factor alpha).
+//
+// §13.4-R2: scored on the residual AFTER the common-mode shift is removed, so a
+// uniform attenuation (a duvet) cancels and only differential change — the
+// signature of actually moving — reaches the score. See PROX_R2_OFFSET_INVARIANT
+// in proximity.h for the full argument. Both scorings are computed on every call
+// so a field log can show what the flip changed; the define picks which one is
+// returned.
 static int signal_fingerprint(const ProxScanVector* v, float* out_L, float* out_wtot) {
     float wtot = 0.0f;
     float loglik = 0.0f;
     int   nb = 0;
+    float sigma_sum = 0.0f;
+    g_cm_delta = g_cm_mad = g_cm_sigma = 0.0f;
+    g_cm_n = 0;
+    g_cm_legacy_L = g_cm_invariant_L = 0.0f;
     for (int i = 0; i < g_reg_count; ++i) {
         AnchorDev* d = &g_reg[i];
         if (!d->in_use) continue;
@@ -355,14 +409,66 @@ static int signal_fingerprint(const ProxScanVector* v, float* out_L, float* out_
         // The standardised residual is scale-free: 0 for a perfect match,
         // -0.5 at 1 sigma, -2 at 2 sigma, -4.5 at 3 sigma, whatever the width.
         loglik += -dx * dx * d->inv2var;
+        if (nb < ANCHOR_PROX_MAX_FINGERPRINT_DEVICES) {
+            g_cm_resid[nb]   = dx;
+            g_cm_inv2var[nb] = d->inv2var;
+            // inv2var = 1/(2 sigma^2), so sigma = sqrt(1/(2 inv2var)).
+            if (d->inv2var > 0.0f) sigma_sum += sqrtf(0.5f / d->inv2var);
+        }
         nb++;
     }
     *out_wtot = wtot;
     g_last_fp_seen = nb;
     if (nb < PROX_MIN_DEVICE_COUNT) { *out_L = 0.0f; return 0; }
-    float avg = loglik / (float)nb;
-    *out_L = logistic((avg - PROX_LL_CENTER) * PROX_LL_SCALE);
+    if (nb > ANCHOR_PROX_MAX_FINGERPRINT_DEVICES) nb = ANCHOR_PROX_MAX_FINGERPRINT_DEVICES;
+
+    const float legacy_L = logistic((loglik / (float)nb - PROX_LL_CENTER) * PROX_LL_SCALE);
+    g_cm_legacy_L    = legacy_L;
+    g_cm_invariant_L = legacy_L;   // overwritten below when the estimate is usable
+    g_cm_n           = nb;
+    g_cm_sigma       = sigma_sum / (float)nb;
+
+    // Too few residuals for a median to mean anything: subtracting a noisy
+    // offset would be worse than subtracting none, so keep the legacy scoring.
+    if (nb < PROX_CM_MIN_SAMPLES) {
+        *out_L = legacy_L;
+        return 1;
+    }
+
+    for (int i = 0; i < nb; ++i) g_cm_scratch[i] = g_cm_resid[i];
+    const float delta = median_f(g_cm_scratch, nb);
+    g_cm_delta = delta;
+
+    float inv_loglik = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        const float c = g_cm_resid[i] - delta;
+        inv_loglik += -c * c * g_cm_inv2var[i];
+        g_cm_scratch[i] = c < 0.0f ? -c : c;
+    }
+    g_cm_mad = median_f(g_cm_scratch, nb);
+    g_cm_invariant_L =
+        logistic((inv_loglik / (float)nb - PROX_LL_CENTER) * PROX_LL_SCALE);
+
+#if PROX_R2_OFFSET_INVARIANT
+    *out_L = g_cm_invariant_L;
+#else
+    *out_L = legacy_L;
+#endif
     return 1;
+}
+
+// The vector moved as a block and kept its shape: everything got weaker (or
+// stronger) together, and the pattern that identifies the place survived. That
+// is what something between the watch and the world looks like; travelling
+// looks different, because it changes emitters by different amounts. Compared
+// against the fingerprint's OWN trained dispersion so it self-scales per anchor.
+// Diagnostic only — see PROX_CM_OCCLUSION_DB.
+static int common_mode_suspected(void) {
+    if (g_cm_n < PROX_CM_MIN_SAMPLES) return 0;
+    const float mag = g_cm_delta < 0.0f ? -g_cm_delta : g_cm_delta;
+    if (mag < PROX_CM_OCCLUSION_DB) return 0;
+    if (g_cm_sigma <= 0.0f) return 0;
+    return g_cm_mad <= PROX_CM_MAD_RATIO * g_cm_sigma;
 }
 
 // Parse the watch's wire format (spec §6.3.1): [1 count][per dev: 6 mac,1 type,1 (rssi+128)].
@@ -413,8 +519,27 @@ static int self_score_delta(const ProxScanVector* v) {
     const int mid  = ((int)g_self_near_dbm + (int)g_self_away_dbm) / 2;
     const int half = span / 2;
 
+    // §13.4-R2: the anchor's own beacon is attenuated by a duvet exactly like
+    // every other emitter, and this term could not tell that from distance —
+    // which is why the downward direction is clamped to half (see
+    // PROX_SELF_DOWN_MAX_U8). Now that the common-mode shift is estimated, undo
+    // the part of a weak reading that the rest of the vector also suffered.
+    //
+    // Applied in ONE direction only, and deliberately. A negative delta
+    // (everything got weaker) is walked back, because that is the reading an
+    // attenuating adversary manufactures. A positive delta is NOT walked back,
+    // because doing so would make concluding FAR cheaper, and §13.0 says that
+    // must never get cheaper. So this correction can only ever reduce
+    // far-evidence, never create it, and the existing clamps still bound it.
+    int level = (int)self_rssi;
+    if (g_cm_n >= PROX_CM_MIN_SAMPLES && g_cm_delta < 0.0f) {
+        int adj = (int)(-g_cm_delta + 0.5f);
+        if (adj > span) adj = span;      // never lift past the demonstrated span
+        level += adj;
+    }
+
     // Full deflection at the demonstrated level, proportional in between.
-    int d = ((int)self_rssi - mid) * (int)PROX_SELF_UP_MAX_U8 / half;
+    int d = (level - mid) * (int)PROX_SELF_UP_MAX_U8 / half;
     if (d >  (int)PROX_SELF_UP_MAX_U8)    d =  (int)PROX_SELF_UP_MAX_U8;
     if (d < -(int)PROX_SELF_DOWN_MAX_U8)  d = -(int)PROX_SELF_DOWN_MAX_U8;
     return d;
@@ -423,6 +548,12 @@ static int self_score_delta(const ProxScanVector* v) {
 ProxScoreResult prox_compute_score(const ProxScanVector* watch_vec) {
     ProxScoreResult r = { 0, 0 };
     g_last_self_delta = 0;
+    // Clear the §13.4-R2 diagnostics up front: the early returns below never
+    // reach signal_fingerprint(), and a stale delta surviving into a log line
+    // (or into self_score_delta()) would describe a vector that is not this one.
+    g_cm_delta = g_cm_mad = g_cm_sigma = 0.0f;
+    g_cm_n     = 0;
+    g_cm_legacy_L = g_cm_invariant_L = 0.0f;
 
     // Low-device-count fallback (§13.4-R1 — "truncation is not distance").
     //
@@ -492,6 +623,7 @@ ProxScoreResult prox_compute_score(const ProxScanVector* watch_vec) {
 
     r.score = (uint8_t)s;
     if (have_fp) r.flags |= PROX_FLAG_FINGERPRINT_ACTIVE;
+    if (common_mode_suspected()) r.flags |= PROX_FLAG_COMMON_MODE;
     return r;
 }
 
